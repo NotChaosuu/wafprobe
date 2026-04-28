@@ -342,7 +342,7 @@ Coverage hovers around 80% across `internal/*`. CI runs on Linux + macOS + Windo
 - [tlsprint](https://github.com/NotChaosuu/tlsprint) — see YOUR TLS fingerprint and what it looks like to antibots
 - [authmap](https://github.com/NotChaosuu/authmap) — auth flow mapper + vulnerability scanner
 - [apkxray](https://github.com/NotChaosuu/apkxray) — APK security analyzer
-- **wafprobe** — what the WAF actually checks (you are here)
+- **wafprobe** — what the WAF actually checks
 
 ## License
 
