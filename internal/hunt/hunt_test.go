@@ -7,15 +7,106 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/NotChaosuu/wafprobe/internal/persona"
 )
 
-// fakeTLSServer returns an HTTPS test server that delegates to gate(). When
-// gate returns a non-empty reason, the server replies 403 with a CF-style
-// challenge body; otherwise 200 "ok".
+// 50/50 random responses must come back Unstable. alternating counter keeps
+// it deterministic at concurrency 1.
+func TestHunt_NoisyRunIsUnstable(t *testing.T) {
+	var n int64
+	srv := fakeTLSServer(t, func(r *http.Request) string {
+		if atomic.AddInt64(&n, 1)%2 == 0 {
+			return "random block"
+		}
+		return ""
+	})
+	defer srv.Close()
+
+	p, _ := persona.ByID("chrome-latest")
+	rep, err := Run(context.Background(), srv.URL, Options{
+		Persona: p, InsecureSkipVerify: true, Concurrency: 1, Repeats: 3,
+		PerProbeTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.NoiseFloor < 0.15 {
+		t.Errorf("a 50/50 target should have a high noise floor, got %.2f", rep.NoiseFloor)
+	}
+	if !rep.Findings.Unstable {
+		t.Errorf("a 50/50 target must be reported Unstable (noise=%.2f)", rep.NoiseFloor)
+	}
+	if len(rep.Findings.Checks) != 0 {
+		t.Errorf("an unstable run must not attribute axes: %v", rep.Findings.Checks)
+	}
+}
+
+// blocked baseline with noise only on the bypass path: median=0, max=0.33,
+// still has to flag unstable.
+func TestHunt_BlockedBaselineNoisyBypassIsUnstable(t *testing.T) {
+	var n int64
+	srv := fakeTLSServer(t, func(r *http.Request) string {
+		if !strings.Contains(r.UserAgent(), "Googlebot") {
+			return "no googlebot" // baseline + all non-bypass cells: deterministic block
+		}
+		if atomic.AddInt64(&n, 1)%2 == 0 {
+			return "random 403 on the bypass path" // the bypass cell flakes
+		}
+		return ""
+	})
+	defer srv.Close()
+
+	p, _ := persona.ByID("chrome-latest")
+	rep, err := Run(context.Background(), srv.URL, Options{
+		Persona: p, InsecureSkipVerify: true, Concurrency: 1, Repeats: 3,
+		PerProbeTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.BaselineOutcome != OutcomeBlocked {
+		t.Fatalf("baseline should be a deterministic block, got %s", rep.BaselineOutcome)
+	}
+	if rep.BaselineFlakeRate != 0 {
+		t.Errorf("baseline flake should be 0 (blocked deterministically), got %.2f — the point is the OTHER signal must catch it", rep.BaselineFlakeRate)
+	}
+	if !rep.Findings.Unstable {
+		t.Errorf("a noisy bypass path must flag the run unstable via max cell flake (noise=%.2f)", rep.NoiseFloor)
+	}
+}
+
+// one blip (first request blocked) gets resampled to 6/7 and doesn't void the run.
+func TestHunt_SingleBlipResampledNotUnstable(t *testing.T) {
+	var n int64
+	srv := fakeTLSServer(t, func(r *http.Request) string {
+		if atomic.AddInt64(&n, 1) == 1 {
+			return "one-off blip"
+		}
+		return ""
+	})
+	defer srv.Close()
+
+	p, _ := persona.ByID("chrome-latest")
+	rep, err := Run(context.Background(), srv.URL, Options{
+		Persona: p, InsecureSkipVerify: true, Concurrency: 1, Repeats: 3,
+		PerProbeTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.Findings.Unstable {
+		t.Errorf("a single blip must not void the run (noise=%.2f) — it should resample away", rep.NoiseFloor)
+	}
+	if rep.NoiseFloor >= 0.15 {
+		t.Errorf("one blip should land below the 15%% floor after resampling, got %.2f", rep.NoiseFloor)
+	}
+}
+
+// fakeTLSServer returns 403 with a CF-style challenge when gate gives a reason, else 200.
 func fakeTLSServer(t *testing.T, gate func(r *http.Request) string) *httptest.Server {
 	t.Helper()
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -38,8 +129,7 @@ func fakeTLSServer(t *testing.T, gate func(r *http.Request) string) *httptest.Se
 	return srv
 }
 
-// TestHunt_UAGate: gate blocks Mozilla / Go-http / python but allows
-// Googlebot. Hunt must classify user-agent as a checked axis.
+// TestHunt_UAGate: only Googlebot passes, so user-agent must be checked.
 func TestHunt_UAGate(t *testing.T) {
 	srv := fakeTLSServer(t, func(r *http.Request) string {
 		ua := r.UserAgent()
@@ -86,8 +176,7 @@ func TestHunt_UAGate(t *testing.T) {
 	}
 }
 
-// TestHunt_TLSVersionGate uses go-stdlib because utls presets hardcode
-// supported_versions; tls-version mutations only affect the stock-TLS path.
+// TestHunt_TLSVersionGate: forced TLS version reaches the wire via supported_versions.
 func TestHunt_TLSVersionGate(t *testing.T) {
 	srv := fakeTLSServer(t, func(r *http.Request) string {
 		if r.TLS != nil && r.TLS.Version == tls.VersionTLS13 {
@@ -97,7 +186,7 @@ func TestHunt_TLSVersionGate(t *testing.T) {
 	})
 	defer srv.Close()
 
-	p, _ := persona.ByID("go-stdlib")
+	p, _ := persona.ByID("chrome-latest")
 	rep, err := Run(context.Background(), srv.URL, Options{
 		Persona:            p,
 		InsecureSkipVerify: true,
@@ -108,8 +197,7 @@ func TestHunt_TLSVersionGate(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// go-stdlib negotiates 1.3 by default → blocked. The "force TLS 1.2"
-	// mutation must flip it.
+	// chrome negotiates 1.3 -> blocked; forcing 1.2 should flip it
 	if rep.BaselineOutcome != OutcomeBlocked {
 		t.Logf("baseline outcome=%s (acceptable if 1.2 was negotiated)", rep.BaselineOutcome)
 	}
@@ -207,9 +295,97 @@ func TestHunt_AllBlocked(t *testing.T) {
 	if len(rep.Findings.PassingMutations) != 0 {
 		t.Errorf("expected 0 passing mutations, got %d", len(rep.Findings.PassingMutations))
 	}
-	if !strings.Contains(rep.Findings.Summary, "no mutation passed") {
-		t.Errorf("summary should flag 'no mutation passed', got %q", rep.Findings.Summary)
+	if !strings.Contains(rep.Findings.Summary, "no verified mutation passed") {
+		t.Errorf("summary should flag 'no verified mutation passed', got %q", rep.Findings.Summary)
 	}
+}
+
+// high noise floor withholds the verdict
+func TestAnalyzeUnstableWithholdsVerdict(t *testing.T) {
+	rep := &Report{
+		Reachable:       true,
+		BaselineOutcome: OutcomePass,
+		NoiseFloor:      0.5,
+		Persona:         persona.Persona{ID: "chrome-latest"},
+		Results: []MutationResult{
+			{Mutation: Mutation{Name: "add X-Real-IP", Axis: "headers"}, Outcome: OutcomeBlocked},
+			{Mutation: Mutation{Name: "method: OPTIONS", Axis: "method"}, Outcome: OutcomeBlocked},
+		},
+	}
+	f := Analyze(rep)
+	if !f.Unstable {
+		t.Fatal("50% noise floor must set Unstable")
+	}
+	if len(f.Checks) != 0 || len(f.Ignores) != 0 {
+		t.Errorf("an unstable verdict must not attribute axes: checks=%v ignores=%v", f.Checks, f.Ignores)
+	}
+	if !strings.Contains(f.Summary, "unstable") {
+		t.Errorf("summary should say the run is unstable: %q", f.Summary)
+	}
+}
+
+// noisy run with a deterministic-block baseline still gets flagged
+func TestAnalyzeBlockedBaselineNoisyCellsUnstable(t *testing.T) {
+	rep := &Report{
+		Reachable:         true,
+		BaselineOutcome:   OutcomeBlocked, // deterministic — its own flake is 0
+		BaselineFlakeRate: 0.0,
+		NoiseFloor:        0.4, // driven by max per-cell disagreement
+		Persona:           persona.Persona{ID: "chrome-latest"},
+		Results: []MutationResult{
+			{Mutation: Mutation{Name: "UA: Googlebot", Axis: "user-agent"}, Outcome: OutcomePass, Samples: 3, Agree: 2},
+		},
+	}
+	f := Analyze(rep)
+	if !f.Unstable {
+		t.Fatal("a noisy run must be Unstable even with a deterministically-blocked baseline")
+	}
+}
+
+// maxCellFlake picks up a single split cell
+func TestMaxCellFlake(t *testing.T) {
+	results := []MutationResult{
+		{Samples: 3, Agree: 3}, // 0.00
+		{Samples: 3, Agree: 2}, // 0.33
+		{Samples: 3, Agree: 3}, // 0.00
+	}
+	if got := maxCellFlake(results); got < 0.32 || got > 0.34 {
+		t.Errorf("max cell flake = %.2f, want ~0.33 (a single split cell must show)", got)
+	}
+	if maxCellFlake(nil) != 0 {
+		t.Error("no cells → 0")
+	}
+}
+
+// A stable run still classifies normally.
+func TestAnalyzeStableBaselineClassifies(t *testing.T) {
+	rep := &Report{
+		Reachable:         true,
+		BaselineOutcome:   OutcomeBlocked,
+		BaselineFlakeRate: 0.0,
+		NoiseFloor:        0.0,
+		Persona:           persona.Persona{ID: "chrome-latest"},
+		Results: []MutationResult{
+			{Mutation: Mutation{Name: "UA: Googlebot", Axis: "user-agent"}, Outcome: OutcomePass},
+			{Mutation: Mutation{Name: "drop Accept", Axis: "headers"}, Outcome: OutcomeBlocked},
+		},
+	}
+	f := Analyze(rep)
+	if f.Unstable {
+		t.Error("a 0% flake baseline must not be Unstable")
+	}
+	if !contains(f.Checks, "user-agent") {
+		t.Errorf("user-agent flipped the block, should be checked: %v", f.Checks)
+	}
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestOutcomeString(t *testing.T) {

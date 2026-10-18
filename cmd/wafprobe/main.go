@@ -1,5 +1,4 @@
-// Command wafprobe is a CLI for probing WAF/bot-management at a target URL.
-// See `wafprobe -h` for subcommands.
+// Command wafprobe probes WAF/bot-management at a target URL.
 package main
 
 import (
@@ -7,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -23,14 +23,16 @@ import (
 )
 
 // Version is overridable at build time: -ldflags "-X main.Version=x.y.z".
-var Version = "0.3.0"
+var Version = "1.0.0"
 
-const topUsage = `wafprobe — probe a target's WAF stack.
+const topUsage = `wafprobe — probe a target's WAF stack. 27 vendors.
 
 Usage:
+  wafprobe                       launch the interactive menu
   wafprobe <subcommand> [flags] <target-url>
 
 Subcommands:
+  menu        interactive menu (default when run with no arguments)
   probe       run multiple TLS personas against the target and classify each response
   hunt        surgically mutate one axis per probe to reverse-engineer what the WAF checks
   import-har  parse a Chrome / Firefox DevTools HAR export, extract the request shape, write a captured persona JSON
@@ -46,11 +48,13 @@ Global examples:
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, topUsage)
-		os.Exit(2)
+		runMenu()
+		return
 	}
 
 	switch os.Args[1] {
+	case "menu":
+		runMenu()
 	case "probe":
 		runProbe(os.Args[2:])
 	case "hunt":
@@ -64,8 +68,7 @@ func main() {
 	case "help", "--help", "-h":
 		fmt.Print(topUsage)
 	default:
-		// Backwards compat: if the first arg looks like a URL or a flag,
-		// treat the whole remainder as `probe` args.
+		// old form: bare URL or flag means `probe`
 		first := os.Args[1]
 		if strings.HasPrefix(first, "http://") || strings.HasPrefix(first, "https://") || strings.HasPrefix(first, "-") {
 			runProbe(os.Args[1:])
@@ -76,8 +79,6 @@ func main() {
 		os.Exit(2)
 	}
 }
-
-// probe subcommand
 
 const probeUsage = `wafprobe probe — run multiple TLS personas against a target.
 
@@ -97,11 +98,12 @@ func runProbe(args []string) {
 	var (
 		jsonOut     = fs.Bool("json", false, "write JSON to stdout")
 		quiet       = fs.Bool("q", false, "suppress banner and progress output")
-		insecure    = fs.Bool("insecure", false, "skip TLS certificate verification")
+		insecure    = fs.Bool("insecure", false, "accepted for compatibility; wafprobe never validates the target certificate (it is a WAF prober, not a secure channel)")
 		exitCode    = fs.Bool("exit-code", false, "exit non-zero if any persona was blocked (for CI)")
 		personaList = fs.String("personas", "", "comma-separated persona IDs (default: all)")
 		concurrency = fs.Int("concurrency", 4, "max parallel requests")
 		timeout     = fs.Duration("timeout", 12*time.Second, "per-request timeout")
+		repeats     = fs.Int("repeats", 3, "samples per persona before voting the outcome (reproducibility)")
 		proxy       = fs.String("proxy", "", "proxy URL: 'user:pass@host:port' OR 'host:port:user:pass' OR 'socks5://host:port'")
 	)
 
@@ -139,6 +141,7 @@ func runProbe(args []string) {
 		RequestTimeout:     *timeout,
 		InsecureSkipVerify: *insecure,
 		Proxy:              proxyURL,
+		Repeats:            *repeats,
 	})
 	results, err := runner.RunAll(ctx, target, personas)
 	if err != nil {
@@ -163,8 +166,6 @@ func runProbe(args []string) {
 		}
 	}
 }
-
-// hunt subcommand
 
 const huntUsage = `wafprobe hunt — surgically reverse-engineer what the WAF checks.
 
@@ -198,11 +199,13 @@ func runHunt(args []string) {
 	var (
 		jsonOut     = fs.Bool("json", false, "write JSON to stdout")
 		quiet       = fs.Bool("q", false, "suppress progress logging")
-		insecure    = fs.Bool("insecure", false, "skip TLS certificate verification")
+		insecure    = fs.Bool("insecure", false, "accepted for compatibility; wafprobe never validates the target certificate (it is a WAF prober, not a secure channel)")
 		personaID   = fs.String("persona", "chrome-latest", "baseline persona id (see `wafprobe list`)")
 		concurrency = fs.Int("concurrency", 4, "max parallel probes")
 		timeout     = fs.Duration("timeout", 10*time.Second, "per-probe timeout")
-		deep        = fs.Bool("deep", false, "intensive mode: run ~50 mutations instead of ~21 (Sec-Ch-Ua, Sec-Fetch-*, origin spoofing, more UAs / methods)")
+		deep        = fs.Bool("deep", false, "intensive mode: run ~66 mutations instead of ~21 (Sec-Ch-Ua, Sec-Fetch-*, origin spoofing, more UAs / methods)")
+		repeats     = fs.Int("repeats", 3, "samples per cell before voting the outcome (reproducibility). The baseline is always sampled at least 3× regardless, so a run costs mutations + ~6 baseline probes")
+		exitCode    = fs.Bool("exit-code", false, "exit 2 if unreachable, 3 if the run was too unstable to attribute, 1 if blocked with no bypass found (for CI)")
 
 		method      = fs.String("method", "GET", "HTTP method for the BASE request (GET/POST/PUT/...)")
 		bodyArg     = fs.String("body", "", "request body. Inline string, or @path to read from file, or @- for stdin")
@@ -225,6 +228,9 @@ func runHunt(args []string) {
 		fatal(err)
 	}
 
+	if canon := persona.Alias(*personaID); canon != "" {
+		fmt.Fprintf(os.Stderr, "note: persona %q was renamed to %q; using it.\n", *personaID, canon)
+	}
 	p, ok := persona.ByID(*personaID)
 	if !ok {
 		fatal(fmt.Errorf("unknown persona %q (use `wafprobe list`)", *personaID))
@@ -243,47 +249,41 @@ func runHunt(args []string) {
 		fatal(fmt.Errorf("--proxy: %w", err))
 	}
 
-	// --persona-file fills in any flag the caller didn't explicitly set.
+	// --persona-file only fills flags the caller didn't set
 	if *personaFile != "" {
 		captured, err := harimport.LoadCaptured(*personaFile)
 		if err != nil {
 			fatal(fmt.Errorf("--persona-file: %w", err))
 		}
-		// User-Agent
 		if captured.UserAgent != "" {
-			// Captured personas use stock TLS by default for replay accuracy.
-			// We synthesize a one-off persona that overrides UA + uses chrome-latest TLS.
+			// captured personas replay on stock TLS; a UA override switches to chrome-latest TLS
 			p.UserAgent = captured.UserAgent
 		}
-		// Method (caller's --method wins if explicitly different from default GET)
 		if *method == "GET" && captured.Method != "" {
 			*method = captured.Method
 		}
-		// Body
 		if len(body) == 0 {
 			capBody, _ := captured.Body()
 			body = capBody
 		}
-		// Cookie
 		if *cookie == "" && captured.Cookie != "" {
 			*cookie = captured.Cookie
 		}
-		// Headers — caller's --header wins per-key
-		if headers == nil {
-			headers = map[string]string{}
+		// caller's --header wins per name, then captured headers in browser order
+		have := map[string]bool{}
+		for _, h := range headers {
+			have[strings.ToLower(h.Name)] = true
 		}
-		for k, v := range captured.Headers {
-			if _, set := headers[k]; !set {
-				headers[k] = v
+		for _, h := range captured.Headers {
+			if !have[strings.ToLower(h.Name)] {
+				headers = append(headers, h)
 			}
 		}
-		// If target wasn't given but captured has one, use it
 		if target == "" && captured.URL != "" {
 			target = captured.URL
 		}
 	}
 
-	// --http1: force ALPN http/1.1 across every probe.
 	var baselineALPN []string
 	if *http1 {
 		baselineALPN = []string{"http/1.1"}
@@ -334,6 +334,7 @@ func runHunt(args []string) {
 		Proxy:              proxyURL,
 		Mutations:          mutations,
 		BaselineALPN:       baselineALPN,
+		Repeats:            *repeats,
 	})
 	if err != nil {
 		fatal(err)
@@ -348,9 +349,18 @@ func runHunt(args []string) {
 			fatal(err)
 		}
 	}
-}
 
-// import-har subcommand
+	if *exitCode {
+		switch {
+		case !rep.Reachable:
+			os.Exit(2) // incomplete: never emit a green from an unreachable target
+		case rep.Findings.Unstable:
+			os.Exit(3)
+		case rep.BaselineOutcome == hunt.OutcomeBlocked && len(rep.Findings.PassingMutations) == 0:
+			os.Exit(1) // blocked and no bypass found
+		}
+	}
+}
 
 const importHARUsage = `wafprobe import-har — extract a request shape from a HAR file.
 
@@ -431,10 +441,9 @@ func runImportHAR(args []string) {
 		fatal(err)
 	}
 
-	fmt.Fprintf(os.Stderr, "✓ captured persona written to %s\n", outPath)
+	fmt.Fprintf(os.Stderr, "captured persona written to %s\n", outPath)
 	fmt.Fprintf(os.Stderr, "  %s\n", captured.Summarize())
 
-	// Highlight known vendor-specific header families if present.
 	notable := vendorNotable(captured.Headers)
 	if len(notable) > 0 {
 		fmt.Fprintf(os.Stderr, "  notable headers: %s\n", strings.Join(notable, ", "))
@@ -444,7 +453,6 @@ func runImportHAR(args []string) {
 	fmt.Fprintf(os.Stderr, "  next: wafprobe hunt --persona-file %s %s\n", outPath, captured.URL)
 }
 
-// generateCapturedID returns a slug-ish id from a URL.
 func generateCapturedID(rawURL string) string {
 	id := rawURL
 	for _, prefix := range []string{"https://", "http://"} {
@@ -462,16 +470,17 @@ func generateCapturedID(rawURL string) string {
 }
 
 // vendorNotable labels JS-injected header families (Shape, Kasada).
-func vendorNotable(headers map[string]string) []string {
+func vendorNotable(headers []persona.HeaderField) []string {
 	var out []string
 	shapeIDs := map[string]int{}
 	kasadaCount := 0
-	for k := range headers {
+	for _, hf := range headers {
+		k := hf.Name
 		lk := strings.ToLower(k)
 		if strings.HasPrefix(lk, "x-kpsdk-") {
 			kasadaCount++
 		}
-		// Shape X-<id>-<letter>: 8-char-ish id, then -<letter>[<digit>]
+		// Shape: X-<id>-<letter>[<digit>], id ~8 chars
 		if len(k) >= 6 && strings.HasPrefix(strings.ToLower(k), "x-") {
 			parts := strings.Split(k, "-")
 			if len(parts) == 3 && len(parts[1]) >= 6 && len(parts[1]) <= 12 {
@@ -492,8 +501,6 @@ func vendorNotable(headers map[string]string) []string {
 	return out
 }
 
-// list subcommand
-
 func runList() {
 	for _, id := range persona.IDs() {
 		p, _ := persona.ByID(id)
@@ -501,18 +508,20 @@ func runList() {
 		if p.Randomized {
 			tag += " (randomized)"
 		}
-		if p.UseStockTLS {
-			tag += " (stock-tls)"
+		if p.Stock {
+			tag += " (stock)"
 		}
 		fmt.Printf("%-16s  %s%s\n", id, p.Name, tag)
 	}
 }
 
-// helpers
-
 func requireHTTPS(target string) error {
 	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
 		return fmt.Errorf("target must start with http:// or https://")
+	}
+	u, err := url.Parse(target)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("%q is not a valid target URL (missing host)", target)
 	}
 	return nil
 }
@@ -527,6 +536,9 @@ func resolvePersonas(list string) ([]persona.Persona, error) {
 		id := strings.TrimSpace(raw)
 		if id == "" {
 			continue
+		}
+		if canon := persona.Alias(id); canon != "" {
+			fmt.Fprintf(os.Stderr, "note: persona %q was renamed to %q; using it.\n", id, canon)
 		}
 		p, ok := persona.ByID(id)
 		if !ok {
@@ -545,8 +557,7 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
-// loadBody resolves a --body argument: "" = no body; "@-" = stdin;
-// "@<path>" = file; otherwise the literal string.
+// loadBody: "" = none, "@-" = stdin, "@path" = file, else literal.
 func loadBody(arg string) ([]byte, error) {
 	if arg == "" {
 		return nil, nil
@@ -560,12 +571,12 @@ func loadBody(arg string) ([]byte, error) {
 	return []byte(arg), nil
 }
 
-// parseHeaders converts "Name: value" strings into a map.
-func parseHeaders(raw []string) (map[string]string, error) {
+// parseHeaders keeps flag order so it reaches the wire.
+func parseHeaders(raw []string) ([]persona.HeaderField, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
-	out := map[string]string{}
+	var out []persona.HeaderField
 	for _, line := range raw {
 		idx := strings.IndexByte(line, ':')
 		if idx < 1 {
@@ -576,12 +587,11 @@ func parseHeaders(raw []string) (map[string]string, error) {
 		if name == "" {
 			return nil, fmt.Errorf("empty header name in --header %q", line)
 		}
-		out[name] = val
+		out = append(out, persona.HeaderField{Name: name, Value: val})
 	}
 	return out, nil
 }
 
-// repeatableStringFlag accumulates values across repeated flag occurrences.
 type repeatableStringFlag []string
 
 func (r *repeatableStringFlag) String() string { return strings.Join(*r, ", ") }

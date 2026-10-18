@@ -9,11 +9,11 @@ import (
 
 // JSONReport is the machine-readable payload written by JSON output mode.
 type JSONReport struct {
-	Tool    string          `json:"tool"`
-	Version string          `json:"version"`
-	Target  string          `json:"target"`
-	Summary probe.Summary   `json:"summary"`
-	Results []probe.Result  `json:"results"`
+	Tool    string         `json:"tool"`
+	Version string         `json:"version"`
+	Target  string         `json:"target"`
+	Summary probe.Summary  `json:"summary"`
+	Results []probe.Result `json:"results"`
 }
 
 // JSON writes the full JSON report to w.

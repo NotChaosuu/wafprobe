@@ -1,16 +1,7 @@
 package detect
 
-// AWS WAF detector.
-//
-// AWS WAF is harder to fingerprint than CDN-based WAFs because the HTTP
-// response is crafted by the origin's WAF rules, not by a universal
-// interstitial. Practical signals:
-//   - `x-amzn-waf-*` / `x-amzn-errortype: WAFBlockException` headers
-//   - default AWS WAF 403 block-page body: "Request blocked." with "AWS WAF"
-//   - CloudFront `x-amz-cf-id` + 403 can imply WAF-at-CloudFront
-//
-// NOTE: AWS WAF is "mid-tier" per bug-bounty conventional wisdom; we keep
-// confidence medium unless a vendor-specific header is present.
+// AWS WAF block pages come from the customer's rules, so there's no universal
+// interstitial. Confidence stays medium unless an x-amzn-waf-* header shows up.
 
 type awsWAF struct{}
 
@@ -35,13 +26,13 @@ func (awsWAF) Detect(resp *Response) *Detection {
 			confidence = "high"
 		}
 	}
-	if bodyContains(resp.Body, "aws waf") && bodyContains(resp.Body, "request blocked") {
+	if resp.bodyHas("aws waf") && resp.bodyHas("request blocked") {
 		signals = append(signals, "body:aws-waf-block")
 		confidence = "high"
 	}
 	if v, ok := hasHeader(resp.Header, "X-Amz-Cf-Id"); ok && resp.StatusCode == 403 {
 		signals = append(signals, "header:x-amz-cf-id="+short(v, 20))
-		// cloudfront returns 403 for lots of reasons — keep low confidence.
+		// cloudfront 403s for lots of reasons
 		if confidence == "medium" {
 			confidence = "low"
 		}

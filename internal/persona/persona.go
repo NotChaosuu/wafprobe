@@ -1,33 +1,39 @@
-// Package persona defines client identities (TLS fingerprint + User-Agent)
-// that wafprobe uses to issue requests against a target.
+// Package persona defines client identities: TLS and HTTP/2 fingerprint,
+// ordered headers and User-Agent, backed by bogdanfinn/tls-client profiles.
 package persona
 
 import (
 	"sort"
 
-	utls "github.com/refraction-networking/utls"
+	"github.com/bogdanfinn/tls-client/profiles"
+	tls "github.com/bogdanfinn/utls"
 )
+
+// HeaderField is one request header in send order.
+type HeaderField struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
 
 // Persona is a single client identity.
 type Persona struct {
-	// ID is a stable slug used on the CLI and in JSON output.
-	ID string
-	// Name is the human-readable label shown in reports.
-	Name string
-	// UserAgent is the HTTP User-Agent header this persona sends.
+	ID        string
+	Name      string
 	UserAgent string
-	// ClientHello is the utls preset used for TLS fingerprinting.
-	// Ignored when UseStockTLS is true.
-	ClientHello utls.ClientHelloID
-	// Randomized is true for personas whose ClientHello shuffles extensions
-	// across calls (modern Chrome 110+ mimics real browser anti-fingerprinting
-	// by permuting extension order). JA3 hashes for Randomized personas will
-	// legitimately vary between runs — downstream code must not assume stability.
+	// Profile is what goes on the wire, and the source of the offline JA3/JA4.
+	Profile profiles.ClientProfile
+	// Headers in send order, without User-Agent (inserted from UserAgent).
+	Headers []HeaderField
+	// Randomized: extension order shuffles per handshake (modern Chrome), so JA3
+	// varies between runs and JA4 doesn't.
 	Randomized bool
-	// UseStockTLS skips utls and uses Go's crypto/tls directly. Useful for
-	// intentionally "bad" personas like go-stdlib / python-requests that
-	// reveal what a naked script looks like to antibots.
-	UseStockTLS bool
+	// Stock marks the naked-script personas (go-stdlib, python-requests).
+	Stock bool
+}
+
+// Hello returns the utls ClientHelloID backing this persona.
+func (p Persona) Hello() tls.ClientHelloID {
+	return p.Profile.GetClientHelloId()
 }
 
 var registry = map[string]Persona{}
@@ -49,8 +55,19 @@ func All() []Persona {
 	return out
 }
 
-// ByID returns the persona with the given id, or false if it isn't registered.
+// retired id -> current id, so old scripts keep working
+var aliases = map[string]string{
+	"safari-17": "safari-16", // renamed in 0.5.0 (the profile was always Safari 16)
+}
+
+// Alias returns the current id for a retired one, or "" if id isn't an alias.
+func Alias(id string) string { return aliases[id] }
+
+// ByID returns the persona with the given id, resolving aliases.
 func ByID(id string) (Persona, bool) {
+	if canon, ok := aliases[id]; ok {
+		id = canon
+	}
 	p, ok := registry[id]
 	return p, ok
 }

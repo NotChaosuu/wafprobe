@@ -24,13 +24,11 @@ func TestParseProxy(t *testing.T) {
 		{"socks5 no auth", "socks5://proxy.example.com:1080", false, false, "proxy.example.com:1080", "", "", "socks5"},
 		{"https proxy", "https://user:pass@proxy.example.com:8443", false, false, "proxy.example.com:8443", "user", "pass", "https"},
 
-		// IP-rotation 4-part form (host:port:user:pass)
+		// host:port:user:pass
 		{"4-part rotation", "proxy.example.com:8080:user:pass", false, false, "proxy.example.com:8080", "user", "pass", "http"},
 		{"4-part with IP host", "1.2.3.4:8000:rotaty:simplepass", false, false, "1.2.3.4:8000", "rotaty", "simplepass", "http"},
-		// Note: '@' inside a 4-part password is documented as unsupported
-		// (use URL form instead). Skipping that ambiguous case.
+		// '@' in a 4-part password is unsupported, not tested
 
-		// errors
 		{"3 parts is ambiguous garbage", "host:port:user", false, true, "", "", "", ""},
 		{"empty host in 4-part", ":8080:u:p", false, true, "", "", "", ""},
 	}
@@ -78,7 +76,6 @@ func TestParseProxy(t *testing.T) {
 }
 
 func TestParseProxy_RoundtripURL(t *testing.T) {
-	// Parsed proxy URLs must round-trip through url.Parse.
 	u, err := ParseProxy("user:pass@proxy.example.com:8080")
 	if err != nil {
 		t.Fatal(err)

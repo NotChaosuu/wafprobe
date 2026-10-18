@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/NotChaosuu/wafprobe/internal/persona"
 )
 
 // realisticHAR is a HAR fixture modelled on a Shape-protected POST.
@@ -159,54 +161,58 @@ func TestPick_EmptyFilter_PicksFirst(t *testing.T) {
 	}
 }
 
-// TestToCaptured_PreservesShapeHeaders: the full X-<id>-<letter> family
-// must survive HAR -> Captured conversion. Without it, --persona-file
-// can't replay Shape requests.
+// Shape's X-<id>-<letter> headers must survive conversion.
 func TestToCaptured_PreservesShapeHeaders(t *testing.T) {
 	path := writeFixture(t, realisticHAR)
 	h, _ := Parse(path)
 	e, _ := h.Pick("api/auth")
 	c := e.ToCaptured("captured:test", "test capture")
 
+	val := func(name string) (string, bool) {
+		for _, h := range c.Headers {
+			if strings.EqualFold(h.Name, name) {
+				return h.Value, true
+			}
+		}
+		return "", false
+	}
+
 	// UA hoisted out of Headers.
 	if c.UserAgent == "" {
 		t.Error("UserAgent should be set")
 	}
-	if _, ok := c.Headers["User-Agent"]; ok {
-		t.Error("User-Agent should NOT remain in Headers map")
+	if _, ok := val("User-Agent"); ok {
+		t.Error("User-Agent should NOT remain in Headers")
 	}
 
-	// Cookie hoisted similarly.
 	if c.Cookie == "" {
 		t.Error("Cookie should be set")
 	}
 
 	// Pseudo-headers stripped.
-	for k := range c.Headers {
-		if strings.HasPrefix(k, ":") {
-			t.Errorf("pseudo-header %q leaked into Headers", k)
+	for _, h := range c.Headers {
+		if strings.HasPrefix(h.Name, ":") {
+			t.Errorf("pseudo-header %q leaked into Headers", h.Name)
 		}
 	}
 
-	// Host MUST be stripped.
-	if _, ok := c.Headers["Host"]; ok {
+	if _, ok := val("Host"); ok {
 		t.Error("Host should be stripped")
 	}
 
 	// Shape header family preserved.
 	want := []string{"X-I1ysm4mm-A", "X-I1ysm4mm-B", "X-I1ysm4mm-C", "X-I1ysm4mm-D", "X-I1ysm4mm-F", "X-I1ysm4mm-Z"}
 	for _, h := range want {
-		if _, ok := c.Headers[h]; !ok {
+		if _, ok := val(h); !ok {
 			t.Errorf("captured persona missing critical Shape header %q", h)
 		}
 	}
 
-	// Origin / Content-Type also survive.
-	if c.Headers["Origin"] != "https://www.uniqlo.com" {
-		t.Errorf("Origin header lost: %q", c.Headers["Origin"])
+	if v, _ := val("Origin"); v != "https://www.uniqlo.com" {
+		t.Errorf("Origin header lost: %q", v)
 	}
-	if c.Headers["Content-Type"] != "application/json" {
-		t.Errorf("Content-Type header lost: %q", c.Headers["Content-Type"])
+	if v, _ := val("Content-Type"); v != "application/json" {
+		t.Errorf("Content-Type header lost: %q", v)
 	}
 
 	// Body round-trips via base64.
@@ -220,8 +226,7 @@ func TestToCaptured_PreservesShapeHeaders(t *testing.T) {
 }
 
 func TestToCaptured_ReconstructsCookieFromArray(t *testing.T) {
-	// HAR variant: no Cookie header, only the Cookies array (some exporters
-	// split them this way).
+	// no Cookie header, only the cookies array
 	har := `{
   "log": {"version":"1.2","entries":[{"startedDateTime":"x","request":{
     "method":"GET","url":"https://x.com/","httpVersion":"h2",
@@ -248,7 +253,7 @@ func TestSaveAndLoadCaptured_Roundtrip(t *testing.T) {
 		Method:    "POST",
 		UserAgent: "TestUA/1.0",
 		Cookie:    "a=b",
-		Headers:   map[string]string{"X-Test": "1", "Origin": "https://x.com"},
+		Headers:   []persona.HeaderField{{Name: "X-Test", Value: "1"}, {Name: "Origin", Value: "https://x.com"}},
 		BodyB64:   base64.StdEncoding.EncodeToString([]byte("hello")),
 	}
 	if err := SaveCaptured(path, in); err != nil {
@@ -273,11 +278,21 @@ func TestSaveAndLoadCaptured_Roundtrip(t *testing.T) {
 func TestLoadCaptured_RejectsWrongSchema(t *testing.T) {
 	path := writeFixture(t, `{"schema":"old-format/v0","id":"x"}`)
 	_, err := LoadCaptured(path)
-	if err == nil {
-		t.Fatal("expected schema-mismatch error")
+	if err == nil || !strings.Contains(err.Error(), "not a wafprobe captured persona") {
+		t.Errorf("non-wafprobe schema should be rejected clearly: %v", err)
 	}
-	if !strings.Contains(err.Error(), "schema mismatch") {
-		t.Errorf("error should mention schema mismatch: %v", err)
+}
+
+// a v1 file (headers as an object) gets the "re-run import-har" message
+func TestLoadCaptured_OldVersionFriendlyError(t *testing.T) {
+	v1 := `{"schema":"wafprobe-captured-persona/v1","id":"x","headers":{"X-A":"1"}}`
+	path := writeFixture(t, v1)
+	_, err := LoadCaptured(path)
+	if err == nil {
+		t.Fatal("expected an error for an old-schema file")
+	}
+	if !strings.Contains(err.Error(), "older wafprobe") || !strings.Contains(err.Error(), "import-har") {
+		t.Errorf("old-schema error should tell the user to re-run import-har: %v", err)
 	}
 }
 
@@ -287,7 +302,7 @@ func TestSummarize_HumanReadable(t *testing.T) {
 		URL:       "https://x.com/login",
 		UserAgent: "TestUA/1.0",
 		Cookie:    "a=b; c=d",
-		Headers:   map[string]string{"X-A": "1", "X-B": "2"},
+		Headers:   []persona.HeaderField{{Name: "X-A", Value: "1"}, {Name: "X-B", Value: "2"}},
 		BodyB64:   base64.StdEncoding.EncodeToString([]byte("hello world")),
 	}
 	out := c.Summarize()

@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// Fixture builders.
-
 func mkResp(status int, headers map[string]string, cookies []*http.Cookie, body string) *Response {
 	h := http.Header{}
 	for k, v := range headers {
@@ -27,10 +25,10 @@ func ck(name, value string) *http.Cookie { return &http.Cookie{Name: name, Value
 
 func TestCloudflare(t *testing.T) {
 	tests := []struct {
-		name     string
-		resp     *Response
-		wantHit  bool
-		wantLayer Layer
+		name        string
+		resp        *Response
+		wantHit     bool
+		wantLayer   Layer
 		wantBlocked bool
 	}{
 		{
@@ -112,20 +110,22 @@ func TestAkamai(t *testing.T) {
 		wantConfidence string
 	}{
 		{
-			"BM: 200 with _abck sensor seed",
-			mkResp(200, nil, []*http.Cookie{ck("_abck", "XYZ~abc~||0||~123")}, ""),
+			// _abck field 1 = -1 -> still profiling
+			"BM: 200 with _abck sensor outstanding (~-1~)",
+			mkResp(200, nil, []*http.Cookie{ck("_abck", "81E92923951C3AFF0F10AD39D429A31A~-1~YAAQHQQsF6P8~-1~-1~-1~-1~-1")}, ""),
 			true, "akamai", LayerSensor, false, "high",
 		},
 		{
-			"BM: 403 + _abck blocking value",
-			mkResp(403, nil, []*http.Cookie{ck("_abck", "XYZ~abc~||1||~bot")}, ""),
+			// 403 blocks whatever the cookie says
+			"BM: 403 is a block (status-driven, not cookie-derived)",
+			mkResp(403, nil, []*http.Cookie{ck("_abck", "453B4BDD13D185F4~-1~YAAQBCg0F3Xa~-1~-1~-1~-1~-1")}, ""),
 			true, "akamai", LayerHTTP, true, "high",
 		},
 		{
-			"BM: sensor_data challenge page",
-			mkResp(200, nil, []*http.Cookie{ck("_abck", "seed~||0||~")},
+			"BM: sensor_data on 200 is profiling, not a block",
+			mkResp(200, nil, []*http.Cookie{ck("_abck", "AAA~-1~BBB~-1~-1~-1~-1~-1")},
 				"function sensor_data(){...}"),
-			true, "akamai", LayerChallenge, true, "high",
+			true, "akamai", LayerSensor, false, "high",
 		},
 		{
 			"BM: 429 with ak_bmsc",
@@ -200,9 +200,10 @@ func TestKasada(t *testing.T) {
 			true, LayerSensor, false,
 		},
 		{
-			"pass: KP_UIDz cookie on 200",
+			// KP_UIDz on a 200 = sensor profiling
+			"sensor: KP_UIDz cookie on 200",
 			mkResp(200, nil, []*http.Cookie{ck("KP_UIDz", "abc123")}, ""),
-			true, LayerPass, false,
+			true, LayerSensor, false,
 		},
 		{
 			"block: 403 with kpsdk body",
@@ -323,9 +324,7 @@ func TestShapeF5(t *testing.T) {
 	}
 }
 
-// TestShape_RealWorldUniqloHeaders: regression test using header names
-// observed on a real Uniqlo login POST. The page-side JS bundle includes
-// these names as string literals, which the body scanner picks up.
+// header names seen on a real Uniqlo login POST, referenced from the JS bundle.
 func TestShape_RealWorldUniqloHeaders(t *testing.T) {
 	bodyJS := `<script>
 		var SHAPE_HEADERS = {
@@ -358,7 +357,6 @@ func TestShape_RealWorldUniqloHeaders(t *testing.T) {
 	}
 }
 
-// TestShape_RegexExtractsIdentifier: id capture across known patterns.
 func TestShape_RegexExtractsIdentifier(t *testing.T) {
 	cases := []struct {
 		input     string
@@ -392,14 +390,14 @@ func TestShape_RegexExtractsIdentifier(t *testing.T) {
 
 func TestLooksLikeTSCookie(t *testing.T) {
 	cases := map[string]bool{
-		"TS012abc":    true,
-		"TSabcd1234":  true,
-		"TSESSIONID":  false,
-		"TSTOKEN":     false,
-		"TS":          false,
-		"tsabc":       true, // case-insensitive prefix, hex suffix
-		"TS01z":       false, // z is not hex
-		"TS123-xyz":   false, // dash not hex
+		"TS012abc":   true,
+		"TSabcd1234": true,
+		"TSESSIONID": false,
+		"TSTOKEN":    false,
+		"TS":         false,
+		"tsabc":      true,  // case-insensitive prefix, hex suffix
+		"TS01z":      false, // z is not hex
+		"TS123-xyz":  false, // dash not hex
 	}
 	for name, want := range cases {
 		if got := looksLikeTSCookie(name); got != want {
@@ -600,9 +598,7 @@ func TestImperva(t *testing.T) {
 // Analyze orchestrator.
 
 func TestAnalyzePrecedence(t *testing.T) {
-	// If BOTH Cloudflare and Akamai signals fire (rare in practice — usually
-	// means Akamai in front of CF or vice versa), Analyze should prefer the
-	// high-confidence blocker.
+	// CF + Akamai both fire: the high confidence blocker wins
 	resp := mkResp(403,
 		map[string]string{"CF-Ray": "xyz", "CF-Mitigated": "challenge", "Server": "AkamaiGHost"},
 		[]*http.Cookie{ck("_abck", "pass~||0||~")},
@@ -618,7 +614,6 @@ func TestAnalyzePrecedence(t *testing.T) {
 }
 
 func TestAnalyzePassThrough(t *testing.T) {
-	// Clean origin with no vendor signals → pass-through detection.
 	resp := mkResp(200, map[string]string{"Server": "nginx"}, nil, "hello world")
 	det := Analyze(resp)
 	if det.Vendor != "" {
@@ -637,7 +632,6 @@ func TestAnalyzeNilResponse(t *testing.T) {
 }
 
 func TestAnalyzeStatusOnly403(t *testing.T) {
-	// Unknown vendor, 403 → HTTP block.
 	resp := mkResp(403, map[string]string{"Server": "unknown"}, nil, "")
 	det := Analyze(resp)
 	if !det.Blocked {
@@ -663,7 +657,7 @@ func TestFromHTTPResponseIsNilSafe(t *testing.T) {
 	if r := FromHTTPResponse(nil, nil); r != nil {
 		t.Errorf("expected nil, got %+v", r)
 	}
-	// no Header map → should still return a Response, with empty slices.
+	// nil Header map
 	hr := &http.Response{StatusCode: 200}
 	r := FromHTTPResponse(hr, nil)
 	if r == nil || r.StatusCode != 200 {
@@ -672,7 +666,6 @@ func TestFromHTTPResponseIsNilSafe(t *testing.T) {
 }
 
 func TestAllSignalsStringer(t *testing.T) {
-	// Smoke test for human-readable signal output.
 	resp := mkResp(403,
 		map[string]string{"CF-Ray": "abcdef", "CF-Mitigated": "challenge"},
 		[]*http.Cookie{ck("__cf_bm", "v")}, "Just a moment")

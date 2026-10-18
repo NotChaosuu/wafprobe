@@ -6,25 +6,33 @@ import (
 	"strings"
 )
 
-// Analyze classifies axes by whether mutations on them flipped the
-// baseline outcome. An axis is "checked" if at least one mutation on it
-// changed a blocked baseline to pass, or a passing baseline to blocked.
+// Analyze buckets axes into checked / ignored / untested based on whether
+// verified mutations flipped the baseline outcome.
 func Analyze(r *Report) Findings {
-	f := Findings{}
+	// non-nil so JSON gets [] not null
+	f := Findings{Checks: []string{}, Ignores: []string{}, Untested: []string{}, PassingMutations: []string{}}
+	if !r.Reachable {
+		return f // caller already set an unreachable summary
+	}
 
 	type axisStat struct {
-		flips     int
-		passes    int
-		blocks    int
-		errors    int
-		total     int
+		flips    int
+		verified int // probes whose mutation was applied and completed (pass/block)
+		untested int // probes that couldn't be verified on the wire (n/a)
+		errors   int
+		total    int
 	}
 	axisStats := map[string]*axisStat{}
-
 	baselinePassed := r.BaselineOutcome == OutcomePass
 
 	for _, res := range r.Results {
 		a := res.Mutation.Axis
+		if a == "combo" {
+			if res.Outcome == OutcomePass {
+				f.PassingMutations = append(f.PassingMutations, res.Mutation.Name)
+			}
+			continue
+		}
 		s, ok := axisStats[a]
 		if !ok {
 			s = &axisStat{}
@@ -32,62 +40,83 @@ func Analyze(r *Report) Findings {
 		}
 		s.total++
 		switch res.Outcome {
+		case OutcomeNA:
+			s.untested++
+		case OutcomeError:
+			s.errors++
 		case OutcomePass:
-			s.passes++
+			s.verified++
 			if !baselinePassed {
 				s.flips++
 			}
 			f.PassingMutations = append(f.PassingMutations, res.Mutation.Name)
 		case OutcomeBlocked:
-			s.blocks++
+			s.verified++
 			if baselinePassed {
 				s.flips++
 			}
-		case OutcomeError:
-			s.errors++
 		}
 	}
 
-	// Classify axes.
+	// too noisy to attribute; NoiseFloor also covers a constant-block baseline
+	const unstableFlake = 0.15
+	noise := r.NoiseFloor
+	if noise >= unstableFlake {
+		f.Unstable = true
+		f.Checks, f.Ignores, f.Untested = []string{}, []string{}, []string{}
+		f.Summary = fmt.Sprintf(
+			"target is unstable — it answered the same request inconsistently (worst cell %.0f%% disagreement across samples), so no axis can be attributed reliably. It's likely rate-limiting or scoring by IP reputation; re-run, slow down, or probe from a cleaner IP.",
+			noise*100)
+		return f
+	}
 	for axis, stat := range axisStats {
-		if axis == "combo" {
-			continue // combo axes are reported separately
+		flipRate := 0.0
+		if stat.verified > 0 {
+			flipRate = float64(stat.flips) / float64(stat.verified)
 		}
-		if stat.flips > 0 {
+		switch {
+		case stat.verified == 0:
+			// nothing verified on this axis
+			f.Untested = append(f.Untested, axis)
+		case stat.flips > 0 && flipRate > noise:
 			f.Checks = append(f.Checks, axis)
-		} else if stat.total > 0 && stat.errors < stat.total {
+		default:
 			f.Ignores = append(f.Ignores, axis)
 		}
 	}
 	sort.Strings(f.Checks)
 	sort.Strings(f.Ignores)
+	sort.Strings(f.Untested)
 
-	// Build the Summary + Recipe.
+	trust := ""
+	if noise > 0 {
+		trust = fmt.Sprintf(" Noise floor %.0f%% — treat borderline axes with care.", noise*100)
+	}
+	untested := ""
+	if len(f.Untested) > 0 {
+		untested = fmt.Sprintf(" Untested (couldn't confirm on the wire): %s.", humanList(f.Untested))
+	}
+
 	switch {
 	case baselinePassed && len(f.Checks) == 0:
-		f.Summary = "target passes with baseline persona; no tested axis mattered."
+		f.Summary = "target passes with baseline persona; no tested axis mattered." + untested + trust
 		f.Recipe = fmt.Sprintf("default client with persona %q works already.", r.Persona.ID)
 
 	case baselinePassed && len(f.Checks) > 0:
-		f.Summary = fmt.Sprintf("target passes baseline but is sensitive to mutations in: %s.",
-			humanList(f.Checks))
+		f.Summary = fmt.Sprintf("target passes baseline but is sensitive to mutations in: %s.%s%s",
+			humanList(f.Checks), untested, trust)
 		f.Recipe = fmt.Sprintf("keep the baseline persona (%s) and avoid the mutations above.", r.Persona.ID)
 
 	case !baselinePassed && len(f.PassingMutations) > 0:
 		f.Summary = fmt.Sprintf(
-			"baseline was %s; %d mutation(s) passed. Target checks: %s. Ignores: %s.",
-			r.BaselineOutcome,
-			len(f.PassingMutations),
-			humanList(f.Checks),
-			humanList(f.Ignores),
-		)
+			"baseline was %s; %d mutation(s) passed. Checks: %s. Ignores: %s.%s%s",
+			r.BaselineOutcome, len(f.PassingMutations), humanList(f.Checks), humanList(f.Ignores), untested, trust)
 		f.Recipe = recipeFrom(r)
 
 	default:
 		f.Summary = fmt.Sprintf(
-			"baseline was %s; no mutation passed. Target rejects every axis tested — likely a JS challenge.",
-			r.BaselineOutcome,
-		)
+			"baseline was %s; no verified mutation passed. Every tested axis was rejected — likely a JS challenge or a hard block.%s%s",
+			r.BaselineOutcome, untested, trust)
 	}
 
 	return f

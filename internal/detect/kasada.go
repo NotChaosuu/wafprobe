@@ -1,16 +1,8 @@
 package detect
 
-// Kasada detector.
-//
-// Kasada serves a JS sensor at /ips.js. Clients that solve the challenge
-// must echo x-kpsdk-ct (token) and x-kpsdk-cd (data) on every protected
-// request; we can only detect those header NAMES being referenced, we can't
-// generate valid values.
-//
-// Server-side signals: x-kpsdk-v / x-kpsdk-cd / x-kpsdk-im response headers,
-// KP_UIDz cookie, /ips.js script reference in body. 429 is Kasada's default
-// block status (most other vendors use 403/503), so we map 429+kasada-sig
-// to LayerHTTP rather than LayerRateLimit.
+// Kasada detector. Clients must echo x-kpsdk-ct/x-kpsdk-cd; we can only see
+// the header names referenced, not make valid values. 429 is Kasada's normal
+// block status, so it maps to LayerHTTP, not LayerRateLimit.
 
 type kasada struct{}
 
@@ -33,10 +25,10 @@ func (kasada) Detect(resp *Response) *Detection {
 	if _, ok := hasCookie(resp.Cookies, "KP_UIDz-ssn"); ok {
 		signals = append(signals, "cookie:KP_UIDz-ssn")
 	}
-	if bodyContains(resp.Body, "/ips.js") {
+	if resp.bodyHas("/ips.js") {
 		signals = append(signals, "body:kasada-ips.js")
 	}
-	if bodyContains(resp.Body, "kpsdk") || bodyContains(resp.Body, "kasada") {
+	if resp.bodyHas("kpsdk") || resp.bodyHas("kasada") {
 		signals = append(signals, "body:kasada-string")
 	}
 
@@ -52,22 +44,17 @@ func (kasada) Detect(resp *Response) *Detection {
 
 	switch {
 	case resp.StatusCode == 429:
-		// Kasada uses 429 as default block, not rate-limit.
-		det.Layer = LayerHTTP
-		det.Blocked = true
-	case resp.StatusCode == 403:
-		det.Layer = LayerHTTP
-		det.Blocked = true
-	case bodyContains(resp.Body, "/ips.js") && resp.StatusCode == 200:
-		// Sensor injected on a passing page; not blocked, but watched.
-		det.Layer = LayerSensor
-		det.Blocked = false
-	case resp.StatusCode >= 500:
 		det.Layer = LayerHTTP
 		det.Blocked = true
 	default:
-		det.Layer = LayerPass
-		det.Blocked = false
+		if layer, blocked := statusLayer(resp); blocked {
+			det.Layer = layer
+			det.Blocked = true
+		} else {
+			// sensor on a passing page. Vercel BotID serves it from /a3/p.js, not /ips.js.
+			det.Layer = LayerSensor
+			det.Blocked = false
+		}
 	}
 
 	return det

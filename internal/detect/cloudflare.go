@@ -2,19 +2,8 @@ package detect
 
 import "strings"
 
-// Cloudflare detector. Identification is keyed on cf-ray, cf-mitigated,
-// and the __cf_bm / cf_clearance cookies (all vendor-specific).
-//
-// We label CF's two distinct bot mechanisms separately:
-//
-//   - Managed Challenge (legacy IUAM, cf_clearance interstitial): 403/503
-//     with "Just a moment..." body. On success the browser gets a
-//     cf_clearance cookie. Signal: body:managed-challenge.
-//
-//   - Turnstile widget (form captcha): 200 OK, page loads; the origin
-//     embeds challenges.cloudflare.com/turnstile JS to gate form submits.
-//     Not a block on the GET — but the page's forms are gated.
-//     Signal: body:turnstile-widget.
+// Cloudflare detector. Managed Challenge ("Just a moment...", 403/503) is a
+// block; a Turnstile widget on a 200 only gates the page's forms.
 
 type cloudflare struct{}
 
@@ -26,7 +15,6 @@ func (cloudflare) Detect(resp *Response) *Detection {
 	}
 	var signals []string
 
-	// Vendor identification.
 	if v, ok := hasHeader(resp.Header, "CF-Ray"); ok {
 		signals = append(signals, "header:cf-ray="+short(v, 24))
 	}
@@ -43,21 +31,19 @@ func (cloudflare) Detect(resp *Response) *Detection {
 		signals = append(signals, "cookie:cf_clearance")
 	}
 
-	// Managed Challenge interstitial.
-	isManagedChallenge := bodyContains(resp.Body, "cloudflare") &&
-		(bodyContains(resp.Body, "attention required") ||
-			bodyContains(resp.Body, "checking your browser") ||
-			bodyContains(resp.Body, "please enable cookies") ||
-			bodyContains(resp.Body, "just a moment") ||
-			bodyContains(resp.Body, "ray id"))
+	isManagedChallenge := resp.bodyHas("cloudflare") &&
+		(resp.bodyHas("attention required") ||
+			resp.bodyHas("checking your browser") ||
+			resp.bodyHas("please enable cookies") ||
+			resp.bodyHas("just a moment") ||
+			resp.bodyHas("ray id"))
 	if isManagedChallenge {
 		signals = append(signals, "body:managed-challenge")
 	}
 
-	// Turnstile widget embedded for form-submit gating.
-	hasTurnstileWidget := bodyContains(resp.Body, "challenges.cloudflare.com/turnstile") ||
-		bodyContains(resp.Body, `class="cf-turnstile"`) ||
-		bodyContains(resp.Body, "cf-turnstile-")
+	hasTurnstileWidget := resp.bodyHas("challenges.cloudflare.com/turnstile") ||
+		resp.bodyHas(`class="cf-turnstile"`) ||
+		resp.bodyHas("cf-turnstile-")
 	if hasTurnstileWidget {
 		signals = append(signals, "body:turnstile-widget")
 	}
@@ -88,7 +74,6 @@ func (cloudflare) Detect(resp *Response) *Detection {
 		det.Layer = LayerHTTP
 		det.Blocked = true
 	case hasTurnstileWidget && resp.StatusCode == 200:
-		// Page loads, but its forms are gated by Turnstile.
 		det.Layer = LayerSensor
 		det.Blocked = false
 	default:
@@ -99,8 +84,6 @@ func (cloudflare) Detect(resp *Response) *Detection {
 }
 
 func init() { Register(cloudflare{}) }
-
-// Helpers shared across detectors.
 
 func short(s string, n int) string {
 	if len(s) <= n {

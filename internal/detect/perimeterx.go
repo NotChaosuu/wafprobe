@@ -1,15 +1,6 @@
 package detect
 
-// PerimeterX / HUMAN Security detector.
-//
-// Signals:
-//   - `_px` / `_pxvid` / `_pxhd` cookies (high confidence)
-//   - `px-*` / `server: perimeterx` headers (rare but possible on enterprise)
-//   - block page body referring to "Please verify you are a human"
-//
-// Block semantics:
-//   - 403 with _px cookie → blocked
-//   - 403 + "perimeterx" in body → challenge
+// PerimeterX / HUMAN detector.
 
 type perimeterx struct{}
 
@@ -32,9 +23,9 @@ func (perimeterx) Detect(resp *Response) *Detection {
 	if v, ok := hasHeader(resp.Header, "X-Px-Block"); ok {
 		signals = append(signals, "header:x-px-block="+short(v, 16))
 	}
-	if bodyContains(resp.Body, "please verify you are a human") ||
-		bodyContains(resp.Body, "perimeterx") ||
-		bodyContains(resp.Body, "_pxcaptcha") {
+	if resp.bodyHas("please verify you are a human") ||
+		resp.bodyHas("perimeterx") ||
+		resp.bodyHas("_pxcaptcha") {
 		signals = append(signals, "body:perimeterx-challenge")
 	}
 
@@ -52,8 +43,8 @@ func (perimeterx) Detect(resp *Response) *Detection {
 	case resp.StatusCode == 429:
 		det.Layer = LayerRateLimit
 		det.Blocked = true
-	case bodyContains(resp.Body, "please verify you are a human") ||
-		bodyContains(resp.Body, "_pxcaptcha"):
+	case resp.bodyHas("please verify you are a human") ||
+		resp.bodyHas("_pxcaptcha"):
 		det.Layer = LayerChallenge
 		det.Blocked = true
 	case resp.StatusCode == 403:

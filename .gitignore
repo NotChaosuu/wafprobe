@@ -15,8 +15,5 @@ coverage.txt
 .DS_Store
 Thumbs.db
 
-# local notes / drafts — not repo content
-TELEGRAM_POST.md
-SCRATCH.md
-TEST_COMMANDS.md
-PRE_PUSH_CHECKLIST.md
+# scratch
+scratch/

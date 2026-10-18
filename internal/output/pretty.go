@@ -1,5 +1,4 @@
-// Package output renders probe results to a stream (stdout or a file) in
-// either a human-readable pretty format or JSON.
+// Package output renders probe results as pretty text or JSON.
 package output
 
 import (
@@ -13,9 +12,7 @@ import (
 	"github.com/NotChaosuu/wafprobe/internal/probe"
 )
 
-// colourEnabled reports whether ANSI codes should be emitted for w.
-// True only for terminal writers without NO_COLOR set; tests always get
-// plain output because they write to bytes.Buffer.
+// colourEnabled is true for a terminal without NO_COLOR.
 func colourEnabled(w io.Writer) bool {
 	if os.Getenv("NO_COLOR") != "" {
 		return false
@@ -31,8 +28,7 @@ func colourEnabled(w io.Writer) bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// Codes is the minimal ANSI set we use. Kept in a small struct so callers
-// (including tests) can swap them off.
+// Codes is the ANSI set we use; zero it to turn colour off.
 type Codes struct {
 	Reset, Bold, Dim, Red, Yellow, Green, Cyan string
 }
@@ -72,6 +68,9 @@ func Pretty(w io.Writer, target string, results []probe.Result, version string) 
 		c.Yellow, s.Errored, c.Reset,
 		s.TotalPersonas,
 	)
+	if s.Flaky > 0 {
+		fmt.Fprintf(w, "  %s%d persona(s) flaked across samples — re-run or raise --repeats%s\n", c.Yellow, s.Flaky, c.Reset)
+	}
 	if len(s.DetectedVendors) > 0 {
 		fmt.Fprintf(w, "  %sVendors seen:%s %s\n", c.Bold, c.Reset, strings.Join(s.DetectedVendors, ", "))
 	}
@@ -93,12 +92,15 @@ func rowFor(r probe.Result, c Codes) string {
 	if vendor == "" {
 		vendor = "-"
 	}
+	// show stacked vendors (e.g. CDN in front of a captcha)
+	if n := len(r.Detection.Also); n > 0 {
+		vendor = fmt.Sprintf("%s (+%d)", vendor, n)
+	}
 	layer := string(r.Detection.Layer)
 	if layer == "" {
 		layer = "-"
 	}
 
-	// color the layer cell based on pass/blocked
 	layerCell := layer
 	switch {
 	case r.Error != "":
@@ -113,15 +115,15 @@ func rowFor(r probe.Result, c Codes) string {
 	if r.Error != "" {
 		detail = truncate(r.Error, 50)
 	}
+	if r.Samples > 1 && r.Agree < r.Samples {
+		detail = fmt.Sprintf("%s %s[%d/%d]%s", detail, c.Yellow, r.Agree, r.Samples, c.Reset)
+	}
 
 	return fmt.Sprintf("  %s\t%s\t%s\t%s\t%s", r.PersonaID, status, vendor, layerCell, detail)
 }
 
-// firstSignal picks the most informative signal for the DETAIL column.
-// Priority: body > cookie > non-cf-ray header > cf-ray > whatever's first.
-// cf-ray is demoted because the VENDOR column already shows "cloudflare";
-// the body signature tells you which CF mechanism (Turnstile vs Managed),
-// which is the actually useful detail.
+// firstSignal picks the DETAIL column: body > cookie > header > cf-ray.
+// cf-ray is last since VENDOR already says cloudflare.
 func firstSignal(r probe.Result) string {
 	sigs := r.Detection.Signals
 	if len(sigs) == 0 {
@@ -130,13 +132,11 @@ func firstSignal(r probe.Result) string {
 		}
 		return "-"
 	}
-	// Walk by descending priority.
 	priorities := [][]string{
 		{"body:", "transport:"},
 		{"cookie:"},
 		{"header:"},
 	}
-	// cf-ray is common to every Cloudflare response; demote it to a tiebreaker.
 	demotable := func(s string) bool {
 		return strings.HasPrefix(strings.ToLower(s), "header:cf-ray")
 	}

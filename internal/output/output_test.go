@@ -72,7 +72,6 @@ func TestPrettyOutputContainsKeyFields(t *testing.T) {
 }
 
 func TestPrettyOutputHasNoANSICodesForNonTerminal(t *testing.T) {
-	// bytes.Buffer is not a *os.File so colourEnabled returns false.
 	var buf bytes.Buffer
 	_ = Pretty(&buf, "https://x", sampleResults(), "0.1.0")
 	if strings.Contains(buf.String(), "\x1b[") {

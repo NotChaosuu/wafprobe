@@ -1,11 +1,6 @@
 package detect
 
-// Imperva (formerly Incapsula) detector.
-//
-// Signals:
-//   - `x-iinfo`, `x-cdn: Incapsula` headers
-//   - `incap_ses_*` and `visid_incap_*` cookies
-//   - Imperva interstitial body: "Incapsula incident ID"
+// Imperva (Incapsula) detector.
 
 type imperva struct{}
 
@@ -29,10 +24,10 @@ func (imperva) Detect(resp *Response) *Detection {
 			break
 		}
 	}
-	if bodyContains(resp.Body, "incapsula incident id") {
+	if resp.bodyHas("incapsula incident id") {
 		signals = append(signals, "body:incapsula-incident-id")
 	}
-	if bodyContains(resp.Body, "access denied") && bodyContains(resp.Body, "imperva") {
+	if resp.bodyHas("access denied") && resp.bodyHas("imperva") {
 		signals = append(signals, "body:imperva-access-denied")
 	}
 

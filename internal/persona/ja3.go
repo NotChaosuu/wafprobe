@@ -12,28 +12,39 @@ import (
 	"strconv"
 	"strings"
 
-	utls "github.com/refraction-networking/utls"
+	"github.com/NotChaosuu/wafprobe/internal/ja4"
+	tls "github.com/bogdanfinn/utls"
 )
 
-// BuildClientHelloRaw constructs but does not send a ClientHello for the
-// given persona, returning the marshalled handshake message bytes. Uses a
-// net.Pipe pair so utls can build state without actual network I/O.
-//
-// Stock-TLS personas return ErrNoOfflineJA3 because their fingerprint is
-// whatever crypto/tls produces at connect time.
+// BuildClientHelloRaw marshals the persona's ClientHello without sending it.
+// utls needs a conn to build state, so it gets one end of a net.Pipe.
 func BuildClientHelloRaw(p Persona, sni string) ([]byte, error) {
-	if p.UseStockTLS {
+	if p.Stock {
+		// HelloGolang is built by crypto/tls at handshake time, can't marshal it offline
 		return nil, ErrNoOfflineJA3
 	}
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
 
-	cfg := &utls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: true,
+	cfg := &tls.Config{ServerName: sni, InsecureSkipVerify: true}
+
+	// The wire client has h3 off, but some presets (Chrome_133) still list h3 in
+	// ALPN, which would give an h3 JA4. Strip it when the spec is available.
+	var uc *tls.UConn
+	if spec, err := p.Profile.GetClientHelloSpec(); err == nil {
+		for _, ext := range spec.Extensions {
+			if a, ok := ext.(*tls.ALPNExtension); ok {
+				a.AlpnProtocols = withoutH3(a.AlpnProtocols)
+			}
+		}
+		uc = tls.UClient(c1, cfg, tls.HelloCustom, false, false, false)
+		if err := uc.ApplyPreset(&spec); err != nil {
+			return nil, fmt.Errorf("apply preset: %w", err)
+		}
+	} else {
+		uc = tls.UClient(c1, cfg, p.Hello(), false, false, false)
 	}
-	uc := utls.UClient(c1, cfg, p.ClientHello)
 	if err := uc.BuildHandshakeState(); err != nil {
 		return nil, fmt.Errorf("build handshake: %w", err)
 	}
@@ -49,9 +60,18 @@ func BuildClientHelloRaw(p Persona, sni string) ([]byte, error) {
 	return out, nil
 }
 
-// ErrNoOfflineJA3 is returned by BuildClientHelloRaw / JA3 when the persona
-// can't be pre-computed offline (stock-TLS personas). Callers should treat
-// this as "captured at connect time" rather than a hard error.
+func withoutH3(protos []string) []string {
+	out := protos[:0]
+	for _, p := range protos {
+		if p == "h3" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// ErrNoOfflineJA3 means the fingerprint is only known at connect time (stock TLS).
 var ErrNoOfflineJA3 = errors.New("no offline JA3 available for this persona")
 
 // JA3 computes the JA3 string and its MD5 hash for a persona's ClientHello.
@@ -61,122 +81,165 @@ func JA3(p Persona, sni string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	s, err := parseJA3(raw)
+	h, err := parseHello(raw)
 	if err != nil {
 		return "", "", err
 	}
+	s := fmt.Sprintf("%d,%s,%s,%s,%s",
+		h.clientVersion,
+		joinU16(stripGREASE(h.cipherSuites)),
+		joinU16(stripGREASE(h.extensionIDs)),
+		joinU16(stripGREASE(h.curves)),
+		joinU8(h.pointFormats),
+	)
 	sum := md5.Sum([]byte(s))
 	return s, hex.EncodeToString(sum[:]), nil
 }
 
-// parseJA3 extracts the JA3 string from a raw ClientHello handshake message
-// (input starts at HandshakeType, not the TLS record header).
-// Format: SSLVersion,Cipher,SSLExtension,EllipticCurve,EllipticCurvePointFormat
-func parseJA3(ch []byte) (string, error) {
-	if len(ch) < 4 || ch[0] != 0x01 {
-		return "", errors.New("not a ClientHello handshake message")
+// JA4 computes the FoxIO JA4 fingerprint. It sorts ciphers and extensions, so it
+// survives utls's per-handshake extension shuffle where JA3 doesn't.
+func JA4(p Persona, sni string) (string, error) {
+	raw, err := BuildClientHelloRaw(p, sni)
+	if err != nil {
+		return "", err
 	}
-	// skip HandshakeType(1) + Length(3)
-	r := bytes.NewReader(ch[4:])
+	h, err := parseHello(raw)
+	if err != nil {
+		return "", err
+	}
+	maxVer := h.clientVersion
+	if h.supportedVersMax != 0 {
+		maxVer = h.supportedVersMax
+	}
+	return ja4.JA4(ja4.ClientHello{
+		TLSVersionMax: maxVer,
+		SNIPresent:    h.sniPresent,
+		CipherSuites:  h.cipherSuites,
+		Extensions:    h.extensionIDs,
+		SigAlgs:       h.sigAlgs,
+		ALPN:          h.alpn,
+	}), nil
+}
 
-	var clientVersion uint16
-	if err := binary.Read(r, binary.BigEndian, &clientVersion); err != nil {
-		return "", fmt.Errorf("client version: %w", err)
+type helloInfo struct {
+	clientVersion    uint16
+	supportedVersMax uint16
+	cipherSuites     []uint16
+	extensionIDs     []uint16
+	curves           []uint16
+	pointFormats     []uint8
+	sigAlgs          []uint16
+	alpn             []string
+	sniPresent       bool
+}
+
+// parseHello expects the handshake message, not the TLS record header.
+func parseHello(ch []byte) (helloInfo, error) {
+	var h helloInfo
+	if len(ch) < 4 || ch[0] != 0x01 {
+		return h, errors.New("not a ClientHello handshake message")
 	}
-	// Random (32 bytes)
-	if _, err := r.Seek(32, io.SeekCurrent); err != nil {
-		return "", fmt.Errorf("random: %w", err)
+	r := bytes.NewReader(ch[4:]) // skip HandshakeType(1) + Length(3)
+
+	if err := binary.Read(r, binary.BigEndian, &h.clientVersion); err != nil {
+		return h, fmt.Errorf("client version: %w", err)
 	}
-	// SessionID (1-byte len + data)
+	if _, err := r.Seek(32, io.SeekCurrent); err != nil { // Random
+		return h, fmt.Errorf("random: %w", err)
+	}
 	var sidLen uint8
 	if err := binary.Read(r, binary.BigEndian, &sidLen); err != nil {
-		return "", fmt.Errorf("session id len: %w", err)
+		return h, fmt.Errorf("session id len: %w", err)
 	}
 	if _, err := r.Seek(int64(sidLen), io.SeekCurrent); err != nil {
-		return "", fmt.Errorf("session id: %w", err)
+		return h, fmt.Errorf("session id: %w", err)
 	}
-	// CipherSuites (2-byte len + uint16 list)
 	var csLen uint16
 	if err := binary.Read(r, binary.BigEndian, &csLen); err != nil {
-		return "", fmt.Errorf("cipher suites len: %w", err)
+		return h, fmt.Errorf("cipher suites len: %w", err)
 	}
 	if csLen%2 != 0 {
-		return "", errors.New("cipher suites length not multiple of 2")
+		return h, errors.New("cipher suites length not multiple of 2")
 	}
-	cipherSuites := make([]uint16, csLen/2)
-	for i := range cipherSuites {
-		if err := binary.Read(r, binary.BigEndian, &cipherSuites[i]); err != nil {
-			return "", fmt.Errorf("cipher suite %d: %w", i, err)
+	h.cipherSuites = make([]uint16, csLen/2)
+	for i := range h.cipherSuites {
+		if err := binary.Read(r, binary.BigEndian, &h.cipherSuites[i]); err != nil {
+			return h, fmt.Errorf("cipher suite %d: %w", i, err)
 		}
 	}
-	// CompressionMethods (1-byte len + data)
 	var cmLen uint8
 	if err := binary.Read(r, binary.BigEndian, &cmLen); err != nil {
-		return "", fmt.Errorf("compression methods len: %w", err)
+		return h, fmt.Errorf("compression methods len: %w", err)
 	}
 	if _, err := r.Seek(int64(cmLen), io.SeekCurrent); err != nil {
-		return "", fmt.Errorf("compression methods: %w", err)
+		return h, fmt.Errorf("compression methods: %w", err)
 	}
-	// Extensions (2-byte len + payload)
 	var extTotal uint16
 	if err := binary.Read(r, binary.BigEndian, &extTotal); err != nil {
-		return "", fmt.Errorf("extensions len: %w", err)
+		return h, fmt.Errorf("extensions len: %w", err)
 	}
 	extPayload := make([]byte, extTotal)
 	if _, err := io.ReadFull(r, extPayload); err != nil {
-		return "", fmt.Errorf("extensions payload: %w", err)
+		return h, fmt.Errorf("extensions payload: %w", err)
 	}
 
-	var (
-		extensionIDs []uint16
-		curves       []uint16
-		pointFormats []uint8
-	)
 	for off := 0; off+4 <= len(extPayload); {
 		extType := binary.BigEndian.Uint16(extPayload[off : off+2])
 		extLen := int(binary.BigEndian.Uint16(extPayload[off+2 : off+4]))
 		off += 4
 		if off+extLen > len(extPayload) {
-			return "", errors.New("truncated extension body")
+			return h, errors.New("truncated extension body")
 		}
 		body := extPayload[off : off+extLen]
 		off += extLen
-
-		extensionIDs = append(extensionIDs, extType)
+		h.extensionIDs = append(h.extensionIDs, extType)
 
 		switch extType {
-		case 10: // supported_groups / elliptic_curves
+		case 0: // server_name
+			h.sniPresent = true
+		case 10: // supported_groups
 			if len(body) >= 2 {
 				groupsLen := int(binary.BigEndian.Uint16(body[:2]))
 				for i := 2; i+2 <= 2+groupsLen && i+2 <= len(body); i += 2 {
-					curves = append(curves, binary.BigEndian.Uint16(body[i:i+2]))
+					h.curves = append(h.curves, binary.BigEndian.Uint16(body[i:i+2]))
 				}
 			}
 		case 11: // ec_point_formats
 			if len(body) >= 1 {
 				formatsLen := int(body[0])
 				for i := 1; i < 1+formatsLen && i < len(body); i++ {
-					pointFormats = append(pointFormats, body[i])
+					h.pointFormats = append(h.pointFormats, body[i])
+				}
+			}
+		case 13: // signature_algorithms
+			if len(body) >= 2 {
+				saLen := int(binary.BigEndian.Uint16(body[:2]))
+				for i := 2; i+2 <= 2+saLen && i+2 <= len(body); i += 2 {
+					h.sigAlgs = append(h.sigAlgs, binary.BigEndian.Uint16(body[i:i+2]))
+				}
+			}
+		case 16: // application_layer_protocol_negotiation (ALPN)
+			for i := 2; i < len(body); {
+				n := int(body[i])
+				i++
+				if i+n > len(body) {
+					break
+				}
+				h.alpn = append(h.alpn, string(body[i:i+n]))
+				i += n
+			}
+		case 43: // supported_versions, real max version for JA4
+			for i := 1; i+2 <= len(body); i += 2 {
+				if v := binary.BigEndian.Uint16(body[i : i+2]); !isGREASE(v) && v > h.supportedVersMax {
+					h.supportedVersMax = v
 				}
 			}
 		}
 	}
-
-	cs := stripGREASE(cipherSuites)
-	ext := stripGREASE(extensionIDs)
-	crv := stripGREASE(curves)
-
-	return fmt.Sprintf("%d,%s,%s,%s,%s",
-		clientVersion,
-		joinU16(cs),
-		joinU16(ext),
-		joinU16(crv),
-		joinU8(pointFormats),
-	), nil
+	return h, nil
 }
 
-// stripGREASE removes GREASE values (RFC 8701) from a uint16 slice.
-// GREASE values follow the pattern 0x?A?A where both nibble-pairs match.
+// stripGREASE removes GREASE values (RFC 8701).
 func stripGREASE(vals []uint16) []uint16 {
 	out := make([]uint16, 0, len(vals))
 	for _, v := range vals {
@@ -189,7 +252,7 @@ func stripGREASE(vals []uint16) []uint16 {
 }
 
 func isGREASE(v uint16) bool {
-	// GREASE: 0x0A0A, 0x1A1A, 0x2A2A, ... — both bytes equal and low nibble == 0xA.
+	// 0x0A0A, 0x1A1A, ...: both bytes equal, low nibble 0xA
 	return (v&0x0f0f) == 0x0a0a && (v>>8) == (v&0x00ff)
 }
 

@@ -21,8 +21,7 @@ func detectStub(vendor string, blocked bool) detect.Detection {
 	return detect.Detection{Vendor: vendor, Layer: layer, Blocked: blocked, Confidence: "high"}
 }
 
-// fakeServer returns an HTTPS test server whose handler mimics a Cloudflare
-// block for User-Agents that look like stock scripts.
+// fakeServer blocks script-looking User-Agents, Cloudflare style.
 func fakeServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -35,7 +34,6 @@ func fakeServer(t *testing.T) *httptest.Server {
 			_, _ = io.WriteString(w, "<title>Just a moment...</title> Checking your browser")
 			return
 		}
-		// Pass-through: echo the UA back.
 		w.Header().Set("CF-Ray", "ok-ray")
 		w.Header().Set("Server", "cloudflare")
 		w.WriteHeader(200)
@@ -75,8 +73,7 @@ func TestRunAll_PassAndBlockedMix(t *testing.T) {
 		t.Fatalf("want %d results, got %d", len(personas), len(results))
 	}
 
-	// fakeServer is a UA-only gate. Browser personas pass; stock-TLS
-	// personas (go-stdlib, python-requests) get blocked.
+	// UA-only gate: browser personas pass, go-stdlib/python-requests get blocked
 	var browserPassed, stockBlocked int
 	for _, res := range results {
 		if res.Error != "" {
@@ -86,9 +83,9 @@ func TestRunAll_PassAndBlockedMix(t *testing.T) {
 		if res.Detection.Vendor != "cloudflare" {
 			t.Errorf("persona %s: expected cloudflare detection, got %q", res.PersonaID, res.Detection.Vendor)
 		}
-		if res.Persona.UseStockTLS {
+		if res.Persona.Stock {
 			if !res.Detection.Blocked {
-				t.Errorf("stock-TLS persona %s should get blocked by the UA gate, but passed", res.PersonaID)
+				t.Errorf("stock persona %s should get blocked by the UA gate, but passed", res.PersonaID)
 			}
 			if res.Detection.Blocked {
 				stockBlocked++
@@ -156,7 +153,7 @@ func TestSummarize(t *testing.T) {
 	}
 }
 
-// TestContextCancellationAbortsRuns: Ctrl-C must not leak goroutines.
+// Ctrl-C must not leak goroutines.
 func TestContextCancellationAbortsRuns(t *testing.T) {
 	srv := fakeServer(t)
 	defer srv.Close()
@@ -169,7 +166,6 @@ func TestContextCancellationAbortsRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunAll: %v", err)
 	}
-	// At least one error is enough; we just need to verify the run aborted.
 	errored := 0
 	for _, r := range results {
 		if r.Error != "" {

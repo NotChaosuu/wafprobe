@@ -2,18 +2,17 @@ package hunt
 
 import (
 	"github.com/NotChaosuu/wafprobe/internal/client"
+	"github.com/NotChaosuu/wafprobe/internal/persona"
 )
 
 // DeepMutations is the extended mutation set used by `hunt --deep`.
-// Adds Sec-CH-UA client hints, Sec-Fetch-* metadata, origin-IP spoofing,
-// 15+ more user agents, exotic methods, and combos.
 func DeepMutations() []Mutation {
 	return append(AllMutations(), deepExtras()...)
 }
 
 func deepExtras() []Mutation {
 	return []Mutation{
-		// Sec-CH-UA client hints — Chrome 90+ sends these, most bots don't
+		// Sec-CH-UA client hints; Chrome sends these, most bots don't
 		{
 			Name: "drop Sec-Ch-Ua hints",
 			Axis: "client-hints",
@@ -22,10 +21,10 @@ func deepExtras() []Mutation {
 			},
 		},
 		{
-			Name: "fake Sec-Ch-Ua: Chrome 147",
+			Name: "fake Sec-Ch-Ua: Chrome 152",
 			Axis: "client-hints",
 			Apply: func(o *client.Options) {
-				addHdr(o, "Sec-Ch-Ua", `"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"`)
+				addHdr(o, "Sec-Ch-Ua", `"Google Chrome";v="152", "Not.A/Brand";v="8", "Chromium";v="152"`)
 				addHdr(o, "Sec-Ch-Ua-Mobile", "?0")
 				addHdr(o, "Sec-Ch-Ua-Platform", `"Windows"`)
 			},
@@ -34,13 +33,13 @@ func deepExtras() []Mutation {
 			Name: "spoof Sec-Ch-Ua: Mobile",
 			Axis: "client-hints",
 			Apply: func(o *client.Options) {
-				addHdr(o, "Sec-Ch-Ua", `"Google Chrome";v="147"`)
+				addHdr(o, "Sec-Ch-Ua", `"Google Chrome";v="152"`)
 				addHdr(o, "Sec-Ch-Ua-Mobile", "?1")
 				addHdr(o, "Sec-Ch-Ua-Platform", `"Android"`)
 			},
 		},
 
-		// Sec-Fetch-* metadata — modern browsers always send these
+		// Sec-Fetch-*; browsers always send these
 		{
 			Name: "add Sec-Fetch-* (real-browser shape)",
 			Axis: "sec-fetch",
@@ -60,28 +59,28 @@ func deepExtras() []Mutation {
 
 		// Origin / forwarding-header spoofing
 		{
-			Name: "spoof True-Client-IP: 127.0.0.1",
-			Axis: "origin-spoof",
+			Name:  "spoof True-Client-IP: 127.0.0.1",
+			Axis:  "origin-spoof",
 			Apply: func(o *client.Options) { addHdr(o, "True-Client-IP", "127.0.0.1") },
 		},
 		{
-			Name: "spoof CF-Connecting-IP: 127.0.0.1",
-			Axis: "origin-spoof",
+			Name:  "spoof CF-Connecting-IP: 127.0.0.1",
+			Axis:  "origin-spoof",
 			Apply: func(o *client.Options) { addHdr(o, "CF-Connecting-IP", "127.0.0.1") },
 		},
 		{
-			Name: "spoof X-Originating-IP",
-			Axis: "origin-spoof",
+			Name:  "spoof X-Originating-IP",
+			Axis:  "origin-spoof",
 			Apply: func(o *client.Options) { addHdr(o, "X-Originating-IP", "127.0.0.1") },
 		},
 		{
-			Name: "spoof X-Forwarded-Host: localhost",
-			Axis: "origin-spoof",
+			Name:  "spoof X-Forwarded-Host: localhost",
+			Axis:  "origin-spoof",
 			Apply: func(o *client.Options) { addHdr(o, "X-Forwarded-Host", "localhost") },
 		},
 		{
-			Name: "spoof X-Forwarded-Proto: http",
-			Axis: "origin-spoof",
+			Name:  "spoof X-Forwarded-Proto: http",
+			Axis:  "origin-spoof",
 			Apply: func(o *client.Options) { addHdr(o, "X-Forwarded-Proto", "http") },
 		},
 
@@ -125,7 +124,7 @@ func deepExtras() []Mutation {
 			Name: "UA: Mobile Chrome (Android)",
 			Axis: "user-agent",
 			Apply: func(o *client.Options) {
-				o.UserAgentOverride = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36"
+				o.UserAgentOverride = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36"
 			},
 		},
 		{
@@ -153,14 +152,14 @@ func deepExtras() []Mutation {
 			Name: "UA: Brave (looks like Chrome but isn't)",
 			Axis: "user-agent",
 			Apply: func(o *client.Options) {
-				o.UserAgentOverride = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Brave/1.78.0"
+				o.UserAgentOverride = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Brave/1.78.0"
 			},
 		},
 		{
 			Name: "UA: Yandex Browser",
 			Axis: "user-agent",
 			Apply: func(o *client.Options) {
-				o.UserAgentOverride = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 YaBrowser/24.10.0.0 Safari/537.36"
+				o.UserAgentOverride = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 YaBrowser/24.10.0.0 Safari/537.36"
 			},
 		},
 		{
@@ -216,14 +215,14 @@ func deepExtras() []Mutation {
 			Name: "UA: Opera",
 			Axis: "user-agent",
 			Apply: func(o *client.Options) {
-				o.UserAgentOverride = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 OPR/115.0.0.0"
+				o.UserAgentOverride = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 OPR/115.0.0.0"
 			},
 		},
 		{
 			Name: "UA: Vivaldi",
 			Axis: "user-agent",
 			Apply: func(o *client.Options) {
-				o.UserAgentOverride = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Vivaldi/6.9.3447.54"
+				o.UserAgentOverride = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Vivaldi/6.9.3447.54"
 			},
 		},
 		{
@@ -250,64 +249,64 @@ func deepExtras() []Mutation {
 
 		// More headers
 		{
-			Name: "add DNT: 1",
-			Axis: "headers",
+			Name:  "add DNT: 1",
+			Axis:  "headers",
 			Apply: func(o *client.Options) { addHdr(o, "DNT", "1") },
 		},
 		{
-			Name: "add Save-Data: on",
-			Axis: "headers",
+			Name:  "add Save-Data: on",
+			Axis:  "headers",
 			Apply: func(o *client.Options) { addHdr(o, "Save-Data", "on") },
 		},
 		{
-			Name: "add Upgrade-Insecure-Requests: 1",
-			Axis: "headers",
+			Name:  "add Upgrade-Insecure-Requests: 1",
+			Axis:  "headers",
 			Apply: func(o *client.Options) { addHdr(o, "Upgrade-Insecure-Requests", "1") },
 		},
 		{
-			Name: "add Priority: u=1, i (Chrome 124+)",
-			Axis: "headers",
+			Name:  "add Priority: u=1, i (Chrome 124+)",
+			Axis:  "headers",
 			Apply: func(o *client.Options) { addHdr(o, "Priority", "u=1, i") },
 		},
 		{
-			Name: "add Cache-Control: no-cache",
-			Axis: "headers",
+			Name:  "add Cache-Control: no-cache",
+			Axis:  "headers",
 			Apply: func(o *client.Options) { addHdr(o, "Cache-Control", "no-cache") },
 		},
 		{
-			Name: "add Pragma: no-cache",
-			Axis: "headers",
+			Name:  "add Pragma: no-cache",
+			Axis:  "headers",
 			Apply: func(o *client.Options) { addHdr(o, "Pragma", "no-cache") },
 		},
 		{
-			Name: "add Range: bytes=0-1023",
-			Axis: "headers",
+			Name:  "add Range: bytes=0-1023",
+			Axis:  "headers",
 			Apply: func(o *client.Options) { addHdr(o, "Range", "bytes=0-1023") },
 		},
 
 		// More methods
 		{
-			Name: "method: PURGE",
-			Axis: "method",
+			Name:  "method: PURGE",
+			Axis:  "method",
 			Apply: func(o *client.Options) { o.MethodOverride = "PURGE" },
 		},
 		{
-			Name: "method: TRACE",
-			Axis: "method",
+			Name:  "method: TRACE",
+			Axis:  "method",
 			Apply: func(o *client.Options) { o.MethodOverride = "TRACE" },
 		},
 		{
-			Name: "method: lowercase get",
-			Axis: "method",
+			Name:  "method: lowercase get",
+			Axis:  "method",
 			Apply: func(o *client.Options) { o.MethodOverride = "get" },
 		},
 
 		// Combos
 		{
-			Name: "FULL Chrome 147 client-hints kit",
+			Name: "FULL Chrome 152 client-hints kit",
 			Axis: "combo",
 			Apply: func(o *client.Options) {
-				addHdr(o, "Sec-Ch-Ua", `"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"`)
+				addHdr(o, "Sec-Ch-Ua", `"Google Chrome";v="152", "Not.A/Brand";v="8", "Chromium";v="152"`)
 				addHdr(o, "Sec-Ch-Ua-Mobile", "?0")
 				addHdr(o, "Sec-Ch-Ua-Platform", `"Windows"`)
 				addHdr(o, "Sec-Fetch-Site", "same-origin")
@@ -329,8 +328,5 @@ func deepExtras() []Mutation {
 }
 
 func addHdr(o *client.Options, name, val string) {
-	if o.ExtraHeaders == nil {
-		o.ExtraHeaders = map[string]string{}
-	}
-	o.ExtraHeaders[name] = val
+	o.ExtraHeaders = append(o.ExtraHeaders, persona.HeaderField{Name: name, Value: val})
 }

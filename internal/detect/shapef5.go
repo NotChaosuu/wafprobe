@@ -1,19 +1,13 @@
 package detect
 
-import "regexp"
+import (
+	"regexp"
+	"strconv"
+)
 
-// Shape Security / F5 XC Bot Defense.
-//
-// Shape's JS sensor injects a family of request headers on every protected
-// XHR with the pattern X-<8-char-id>-<letter>[<digit>]. The 8-char id is
-// randomized per deployment but stable per site, and the Z header is
-// always literal "q". The sensor JS bundle in the page references those
-// header NAMES as string literals, so a body regex on the names is enough
-// to identify Shape without seeing outgoing browser traffic.
-//
-// We claim "high" confidence only when 2+ matches share the same id —
-// random co-occurrence of e.g. X-Foo-A and X-Foo-Z in unrelated content
-// is implausible.
+// Shape / F5 XC Bot Defense. The sensor adds X-<8-char-id>-<letter>[<digit>]
+// headers (Z is always "q"), and the JS bundle has those names as literals,
+// so a body regex is enough. High confidence needs 2+ matches on the same id.
 
 type shapef5 struct{}
 
@@ -22,21 +16,22 @@ func (shapef5) Vendor() string { return "shape-f5" }
 // X-<id>-<letter>[<digit>] header family.
 var shapeHeaderPattern = regexp.MustCompile(`X-[A-Za-z0-9]{6,12}-[A-Z][0-9]?\b`)
 
-// Captures the id portion so we can group matches.
 var shapeIDPattern = regexp.MustCompile(`X-([A-Za-z0-9]{6,12})-[A-Z][0-9]?\b`)
+
+// shapeScriptRef only matches anchored refs like src="/_shape_/..." or "f5-cc".
+var shapeScriptRef = regexp.MustCompile(`(?i)(?:[/"'\s]_shape_|_shape_[/"'\s]|[/"'\s]f5-cc[/"'.\- ])`)
 
 func (shapef5) Detect(resp *Response) *Detection {
 	if resp == nil {
 		return nil
 	}
 	var (
-		signals    []string
-		hasTS      bool
-		hasBodySig bool
+		signals         []string
+		hasInterruption bool // Shape/F5 block interstitial ("pardon our interruption")
+		hasScriptRef    bool // anchored Shape/F5 sensor script reference
 		hasShapeHeaders bool
 	)
 
-	// Match the header NAMES as string literals in the page's JS bundle.
 	if len(resp.Body) > 0 {
 		matches := shapeHeaderPattern.FindAll(resp.Body, -1)
 		if len(matches) >= 2 {
@@ -48,7 +43,7 @@ func (shapef5) Detect(resp *Response) *Detection {
 			}
 			for id, count := range ids {
 				if count >= 2 {
-					signals = append(signals, "body:shape-headers id="+id+" count="+itoa(count))
+					signals = append(signals, "body:shape-headers id="+id+" count="+strconv.Itoa(count))
 					hasShapeHeaders = true
 					break
 				}
@@ -60,20 +55,19 @@ func (shapef5) Detect(resp *Response) *Detection {
 		if hasPrefixFold(c.Name, "TS") && len(c.Name) >= 4 && len(c.Name) <= 24 {
 			if looksLikeTSCookie(c.Name) {
 				signals = append(signals, "cookie:"+c.Name)
-				hasTS = true
 			}
 		}
 	}
 
-	if bodyContains(resp.Body, "pardon our interruption") ||
-		bodyContains(resp.Body, "we've seen some unusual activity") ||
-		bodyContains(resp.Body, "we apologize for the inconvenience") {
+	if resp.bodyHas("pardon our interruption") ||
+		resp.bodyHas("we've seen some unusual activity") ||
+		resp.bodyHas("we apologize for the inconvenience") {
 		signals = append(signals, "body:shape-interruption-page")
-		hasBodySig = true
+		hasInterruption = true
 	}
-	if bodyContains(resp.Body, "_shape_") || bodyContains(resp.Body, "f5-cc") {
+	if len(resp.Body) > 0 && shapeScriptRef.Match(resp.Body) {
 		signals = append(signals, "body:shape-script-ref")
-		hasBodySig = true
+		hasScriptRef = true
 	}
 
 	if server, ok := hasHeader(resp.Header, "Server"); ok &&
@@ -88,39 +82,41 @@ func (shapef5) Detect(resp *Response) *Detection {
 		return nil
 	}
 
-	confidence := "medium"
-	switch {
-	case hasShapeHeaders, hasBodySig:
-		confidence = "high"
-	case hasTS:
-		// TS cookie alone could be vanilla BIG-IP without Shape.
-		confidence = "medium"
+	// a lone TS cookie or F5 server header is just BIG-IP, not Shape.
+	shapeSpecific := hasShapeHeaders || hasInterruption || hasScriptRef
+	det := &Detection{}
+	if shapeSpecific {
+		det.Vendor = "shape-f5"
+		if hasShapeHeaders || hasInterruption {
+			det.Confidence = "high"
+		} else {
+			det.Confidence = "medium" // script-ref alone
+		}
+	} else {
+		det.Vendor = "f5-bigip"
+		det.Confidence = "medium"
 	}
-
-	det := &Detection{
-		Vendor:     "shape-f5",
-		Confidence: confidence,
-		Signals:    signals,
-	}
+	det.Signals = signals
 
 	switch {
 	case resp.StatusCode == 429:
 		det.Layer = LayerRateLimit
 		det.Blocked = true
-	case resp.StatusCode == 403 || hasBodySig:
+	case hasInterruption:
 		det.Layer = LayerChallenge
+		det.Blocked = true
+	case resp.StatusCode == 403:
+		det.Layer = LayerHTTP
 		det.Blocked = true
 	case resp.StatusCode >= 500:
 		det.Layer = LayerHTTP
 		det.Blocked = true
-	case hasShapeHeaders && resp.StatusCode == 200:
-		// Shape sensor is deployed on this page but didn't block — but the
-		// next protected POST will require the headers. Tag as sensor.
+	case shapeSpecific && resp.StatusCode < 400:
+		// sensor on a passing page; the next protected POST needs the headers
 		det.Layer = LayerSensor
 		det.Blocked = false
 	default:
-		det.Layer = LayerPass
-		det.Blocked = false
+		det.Layer, det.Blocked = statusLayer(resp)
 	}
 
 	return det
@@ -128,8 +124,7 @@ func (shapef5) Detect(resp *Response) *Detection {
 
 func init() { Register(shapef5{}) }
 
-// looksLikeTSCookie matches F5's TS<hex> session cookie pattern. We need
-// this strict form to avoid matching TSESSIONID / TSTOKEN / TSToken etc.
+// looksLikeTSCookie matches TS<hex> strictly so TSESSIONID/TSTOKEN don't.
 func looksLikeTSCookie(name string) bool {
 	if len(name) < 3 {
 		return false
@@ -148,28 +143,4 @@ func looksLikeTSCookie(name string) bool {
 		}
 	}
 	return true
-}
-
-// itoa avoids importing strconv just for a small helper.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	pos := len(buf)
-	neg := false
-	if n < 0 {
-		neg = true
-		n = -n
-	}
-	for n > 0 {
-		pos--
-		buf[pos] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
 }

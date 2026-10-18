@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/NotChaosuu/wafprobe/internal/hunt"
 )
@@ -25,9 +26,21 @@ func HuntPretty(w io.Writer, r *hunt.Report, version string) error {
 		outcomeColoured(r.BaselineOutcome, c),
 		vendorOrNone(r.BaselineDetection.Vendor, c),
 	)
+	if r.Repeats > 0 {
+		var flakeNote string
+		switch {
+		case r.Repeats < 2:
+			// one sample can't be called stable
+			flakeNote = "stability not measured (1 sample per cell)"
+		case r.NoiseFloor > 0:
+			flakeNote = fmt.Sprintf("%.0f%% flake", r.NoiseFloor*100)
+		default:
+			flakeNote = "stable"
+		}
+		fmt.Fprintf(w, "  %ssampled %d× per cell · %s%s\n", c.Dim, r.Repeats, flakeNote, c.Reset)
+	}
 	fmt.Fprintln(w)
 
-	// Probe matrix
 	fmt.Fprintf(w, "  %ssurgical axis mutations%s (%d probes)\n", c.Bold, c.Reset, len(r.Results))
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "  %s%-36s  %-12s  %-6s%s\n", c.Dim, "MUTATION", "AXIS", "RESULT", c.Reset)
@@ -42,11 +55,18 @@ func HuntPretty(w io.Writer, r *hunt.Report, version string) error {
 	}
 	fmt.Fprintln(w)
 
-	// Reverse-engineered verdict
 	fmt.Fprintln(w, boxTop(c, "REVERSE-ENGINEERED", 58))
 	writeBoxLine(w, c, 58, "")
-	writeBoxLine(w, c, 58, fmt.Sprintf("  %sTarget checks:%s  %s", c.Bold, c.Reset, humanList(r.Findings.Checks, c.Green)))
-	writeBoxLine(w, c, 58, fmt.Sprintf("  %sTarget ignores:%s %s", c.Bold, c.Reset, humanList(r.Findings.Ignores, c.Dim)))
+	if r.Findings.Unstable {
+		// too flaky to attribute
+		writeBoxLine(w, c, 58, fmt.Sprintf("  %sRun unstable — no axis attribution%s", c.Yellow, c.Reset))
+	} else {
+		writeBoxLine(w, c, 58, fmt.Sprintf("  %sTarget checks:%s  %s", c.Bold, c.Reset, humanList(r.Findings.Checks, c.Green)))
+		writeBoxLine(w, c, 58, fmt.Sprintf("  %sTarget ignores:%s %s", c.Bold, c.Reset, humanList(r.Findings.Ignores, c.Dim)))
+		if len(r.Findings.Untested) > 0 {
+			writeBoxLine(w, c, 58, fmt.Sprintf("  %sUntested (unverified):%s %s", c.Bold, c.Reset, humanList(r.Findings.Untested, c.Yellow)))
+		}
+	}
 	writeBoxLine(w, c, 58, "")
 	if r.Findings.Recipe != "" {
 		writeBoxLine(w, c, 58, fmt.Sprintf("  %sBypass recipe:%s", c.Bold, c.Reset))
@@ -60,17 +80,18 @@ func HuntPretty(w io.Writer, r *hunt.Report, version string) error {
 	fmt.Fprintln(w, boxBottom(c, 58))
 	fmt.Fprintln(w)
 
-	// Curl bypass recipe for the first passing mutation, when baseline blocked.
+	// curl recipe for first passing mutation; skipped on unstable runs (likely luck)
 	for _, res := range r.Results {
+		if r.Findings.Unstable {
+			break
+		}
 		if res.Outcome != hunt.OutcomePass {
 			continue
 		}
-		// Only emit a recipe when the baseline was blocked; if it already
-		// passes, the user has nothing to bypass.
 		if r.BaselineOutcome != hunt.OutcomeBlocked {
 			break
 		}
-		fmt.Fprintf(w, "  %s%s↓ ready-to-run curl for first passing mutation (%s):%s\n",
+		fmt.Fprintf(w, "  %s%sready-to-run curl for first passing mutation (%s):%s\n",
 			c.Bold, c.Cyan, res.Mutation.Name, c.Reset)
 		fmt.Fprintln(w)
 		curl := hunt.CurlFor(r.Target, r.Method, r.Persona.UserAgent, r.Cookie, r.Body, r.Headers, res.Mutation)
@@ -90,6 +111,9 @@ func HuntJSON(w io.Writer, r *hunt.Report, version string) error {
 		Axis     string `json:"axis"`
 		Status   int    `json:"status,omitempty"`
 		Outcome  string `json:"outcome"`
+		Applied  bool   `json:"applied"`
+		Samples  int    `json:"samples,omitempty"`
+		Agree    int    `json:"agree,omitempty"`
 		Vendor   string `json:"vendor,omitempty"`
 		Layer    string `json:"layer,omitempty"`
 		Blocked  bool   `json:"blocked"`
@@ -97,16 +121,21 @@ func HuntJSON(w io.Writer, r *hunt.Report, version string) error {
 		Duration int64  `json:"duration_ms"`
 	}
 	type reportJSON struct {
-		Tool           string         `json:"tool"`
-		Version        string         `json:"version"`
-		Target         string         `json:"target"`
-		Persona        string         `json:"persona"`
-		BaselineOutcome string        `json:"baseline_outcome"`
-		BaselineStatus int            `json:"baseline_status"`
-		BaselineVendor string         `json:"baseline_vendor,omitempty"`
-		Mutations      []mutationJSON `json:"mutations"`
-		Findings       hunt.Findings  `json:"findings"`
-		DurationMS     int64          `json:"duration_ms"`
+		Tool            string         `json:"tool"`
+		Version         string         `json:"version"`
+		Target          string         `json:"target"`
+		Persona         string         `json:"persona"`
+		Reachable       bool           `json:"reachable"`
+		Complete        bool           `json:"complete"`
+		BaselineOutcome string         `json:"baseline_outcome"`
+		BaselineStatus  int            `json:"baseline_status"`
+		BaselineVendor  string         `json:"baseline_vendor,omitempty"`
+		BaselineFlake   float64        `json:"baseline_flake_rate"`
+		NoiseFloor      float64        `json:"noise_floor"`
+		Repeats         int            `json:"repeats"`
+		Mutations       []mutationJSON `json:"mutations"`
+		Findings        hunt.Findings  `json:"findings"`
+		DurationMS      int64          `json:"duration_ms"`
 	}
 	muts := make([]mutationJSON, len(r.Results))
 	for i, res := range r.Results {
@@ -115,6 +144,9 @@ func HuntJSON(w io.Writer, r *hunt.Report, version string) error {
 			Axis:     res.Mutation.Axis,
 			Status:   res.Status,
 			Outcome:  res.Outcome.String(),
+			Applied:  res.Applied,
+			Samples:  res.Samples,
+			Agree:    res.Agree,
 			Vendor:   res.Detection.Vendor,
 			Layer:    string(res.Detection.Layer),
 			Blocked:  res.Detection.Blocked,
@@ -127,9 +159,14 @@ func HuntJSON(w io.Writer, r *hunt.Report, version string) error {
 		Version:         version,
 		Target:          r.Target,
 		Persona:         r.Persona.ID,
+		Reachable:       r.Reachable,
+		Complete:        r.Reachable,
 		BaselineOutcome: r.BaselineOutcome.String(),
 		BaselineStatus:  r.BaselineStatus,
 		BaselineVendor:  r.BaselineDetection.Vendor,
+		BaselineFlake:   r.BaselineFlakeRate,
+		NoiseFloor:      r.NoiseFloor,
+		Repeats:         r.Repeats,
 		Mutations:       muts,
 		Findings:        r.Findings,
 		DurationMS:      r.Duration.Milliseconds(),
@@ -139,8 +176,7 @@ func HuntJSON(w io.Writer, r *hunt.Report, version string) error {
 	return enc.Encode(&rep)
 }
 
-// OutcomeAlias re-exports hunt.Outcome so box rendering above stays
-// in this file (avoiding a circular import / cluttered pretty.go).
+// OutcomeAlias re-exports hunt.Outcome.
 type OutcomeAlias = hunt.Outcome
 
 func outcomeColoured(o hunt.Outcome, c Codes) string {
@@ -151,6 +187,8 @@ func outcomeColoured(o hunt.Outcome, c Codes) string {
 		return c.Red + "block" + c.Reset
 	case hunt.OutcomeError:
 		return c.Yellow + "err" + c.Reset
+	case hunt.OutcomeNA:
+		return c.Dim + "n/a" + c.Reset
 	default:
 		return "?"
 	}
@@ -170,8 +208,6 @@ func humanList(xs []string, color string) string {
 	return color + strings.Join(xs, ", ") + ""
 }
 
-// Box-drawing helpers.
-
 func boxTop(c Codes, title string, width int) string {
 	inner := width - len(title) - 4
 	left := inner / 2
@@ -185,48 +221,45 @@ func boxBottom(c Codes, width int) string {
 
 func writeBoxLine(w io.Writer, c Codes, width int, content string) {
 	stripped := stripANSI(content)
-	// If content is wider than the box, soft-wrap onto continuation lines
-	// with a two-space hanging indent.
+	// measure in runes so "—" / "→" don't throw off padding
 	inner := width - 2
-	if len(stripped) <= inner {
-		pad := inner - len(stripped)
+	if utf8.RuneCountInString(stripped) <= inner {
+		pad := inner - utf8.RuneCountInString(stripped)
 		fmt.Fprintf(w, "%s║%s%s%s%s║%s\n", c.Dim, c.Reset, content, strings.Repeat(" ", pad), c.Dim, c.Reset)
 		return
 	}
-	// Wrap. Since content may contain ANSI codes, be conservative and chop
-	// by visible-length on spaces.
-	// Simple approach: split into words, greedy-fill by visible length.
+	// wrap on words by rune length; colour is dropped on continuation lines
 	words := strings.Fields(stripped)
 	if len(words) == 0 {
 		words = []string{stripped}
 	}
 	lines := []string{}
 	cur := ""
-	for _, w := range words {
-		if len(cur)+len(w)+1 > inner {
+	for _, word := range words {
+		if utf8.RuneCountInString(cur)+utf8.RuneCountInString(word)+1 > inner {
 			lines = append(lines, cur)
-			cur = "  " + w // hanging indent
+			cur = "  " + word // hanging indent
 		} else if cur == "" {
-			cur = w
+			cur = word
 		} else {
-			cur += " " + w
+			cur += " " + word
 		}
 	}
 	if cur != "" {
 		lines = append(lines, cur)
 	}
 	for _, line := range lines {
-		pad := inner - len(line)
+		lw := utf8.RuneCountInString(line)
+		pad := inner - lw
 		if pad < 0 {
 			pad = 0
-			line = line[:inner]
+			line = string([]rune(line)[:inner])
 		}
 		fmt.Fprintf(w, "%s║%s%s%s%s║%s\n", c.Dim, c.Reset, line, strings.Repeat(" ", pad), c.Dim, c.Reset)
 	}
 }
 
 func stripANSI(s string) string {
-	// simple ANSI CSI stripper: \x1b[ ... m
 	var b strings.Builder
 	inEsc := false
 	for _, r := range s {

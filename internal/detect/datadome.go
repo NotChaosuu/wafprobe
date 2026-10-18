@@ -1,17 +1,6 @@
 package detect
 
-// DataDome detector.
-//
-// Signals:
-//   - `datadome` cookie set (high confidence)
-//   - `x-datadome` / `x-dd-b` response headers
-//   - `Server: DataDome` response header
-//   - 403 + DataDome captcha page body
-//
-// Block semantics:
-//   - 403 with datadome cookie → block
-//   - 403 + "geo.captcha-delivery.com" → challenge (interstitial)
-//   - 200 + datadome cookie → pass with tracking
+// DataDome detector. geo.captcha-delivery.com on a 403 is the captcha interstitial.
 
 type datadome struct{}
 
@@ -35,9 +24,9 @@ func (datadome) Detect(resp *Response) *Detection {
 	if server, ok := hasHeader(resp.Header, "Server"); ok && hasPrefixFold(server, "DataDome") {
 		signals = append(signals, "header:server=DataDome")
 	}
-	if bodyContains(resp.Body, "geo.captcha-delivery.com") ||
-		bodyContains(resp.Body, "dd-captcha") ||
-		(bodyContains(resp.Body, "datadome") && bodyContains(resp.Body, "captcha")) {
+	if resp.bodyHas("geo.captcha-delivery.com") ||
+		resp.bodyHas("dd-captcha") ||
+		(resp.bodyHas("datadome") && resp.bodyHas("captcha")) {
 		signals = append(signals, "body:datadome-captcha")
 	}
 
@@ -55,7 +44,7 @@ func (datadome) Detect(resp *Response) *Detection {
 	case resp.StatusCode == 429:
 		det.Layer = LayerRateLimit
 		det.Blocked = true
-	case bodyContains(resp.Body, "geo.captcha-delivery.com") || bodyContains(resp.Body, "dd-captcha"):
+	case resp.bodyHas("geo.captcha-delivery.com") || resp.bodyHas("dd-captcha"):
 		det.Layer = LayerChallenge
 		det.Blocked = true
 	case resp.StatusCode == 403:

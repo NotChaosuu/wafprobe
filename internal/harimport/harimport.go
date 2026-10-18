@@ -1,10 +1,7 @@
-// Package harimport reads HAR 1.2 files (Chrome/Firefox DevTools, Charles,
-// Fiddler, mitmproxy) and converts a chosen request into a Captured persona
-// JSON — a frozen snapshot of the User-Agent, headers, cookies, body, method.
-//
-// hunt loads these via --persona-file and replays them as the baseline,
-// which is how we test sites whose JS-injected request headers (Shape,
-// Akamai _abck, Kasada x-kpsdk-*) can only be observed, not synthesized.
+// Package harimport turns a request from a HAR 1.2 file into a Captured
+// persona that hunt can replay via --persona-file. That's the only way to test
+// sites whose JS-injected headers (Shape, Akamai _abck, Kasada x-kpsdk-*)
+// can't be synthesized.
 package harimport
 
 import (
@@ -12,30 +9,32 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
+
+	"github.com/NotChaosuu/wafprobe/internal/persona"
 )
 
 // Captured is the persona file written to disk. Flat JSON, hand-editable.
 type Captured struct {
-	Schema    string            `json:"schema"`
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	URL       string            `json:"url"`
-	Method    string            `json:"method"`
-	UserAgent string            `json:"user_agent,omitempty"`
-	Cookie    string            `json:"cookie,omitempty"`
-	// Headers excludes User-Agent, Cookie, Host, and HTTP/2 pseudo-headers
-	// (those are either hoisted to top-level fields or set by the transport).
-	Headers map[string]string `json:"headers,omitempty"`
-	BodyB64 string            `json:"body_b64,omitempty"`
-	Notes   string            `json:"notes,omitempty"`
+	Schema    string `json:"schema"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	Method    string `json:"method"`
+	UserAgent string `json:"user_agent,omitempty"`
+	Cookie    string `json:"cookie,omitempty"`
+	// Headers keeps browser order; UA, Cookie, Host and pseudo-headers are excluded.
+	Headers []persona.HeaderField `json:"headers,omitempty"`
+	BodyB64 string                `json:"body_b64,omitempty"`
+	Notes   string                `json:"notes,omitempty"`
 }
 
 // SchemaTag identifies files this tool writes. Bumped on breaking changes.
-const SchemaTag = "wafprobe-captured-persona/v1"
+const SchemaTag = "wafprobe-captured-persona/v2"
 
-// HAR is the subset of HAR 1.2 we read. Hand-parsed to keep deps minimal.
+// HAR is the subset of HAR 1.2 we read.
 type HAR struct {
 	Log struct {
 		Version string `json:"version"`
@@ -67,8 +66,8 @@ type NameValue struct {
 }
 
 type PostData struct {
-	MimeType string `json:"mimeType"`
-	Text     string `json:"text"`
+	MimeType string      `json:"mimeType"`
+	Text     string      `json:"text"`
 	Params   []NameValue `json:"params,omitempty"`
 }
 
@@ -88,9 +87,8 @@ func Parse(path string) (*HAR, error) {
 	return &h, nil
 }
 
-// Pick returns one entry matching filter (case-insensitive substring on URL).
-// Empty filter returns the first entry. If multiple match, the LAST one wins
-// — usually the most-recent POST in a session is what you want.
+// Pick returns the last entry whose URL contains filter (case-insensitive),
+// usually the latest POST. Empty filter returns the first entry.
 func (h *HAR) Pick(filter string) (*Entry, error) {
 	if filter == "" {
 		return &h.Log.Entries[0], nil
@@ -128,18 +126,15 @@ func (h *HAR) PickAll(filter string) []*Entry {
 	return matches
 }
 
-// ToCaptured converts a HAR entry into a Captured persona. UA and Cookie
-// are hoisted to top-level fields; Host, Content-Length, and HTTP/2 pseudo-
-// headers (':method' etc) are dropped because the transport sets them.
-// Body is base64-encoded so binary payloads survive the JSON round-trip.
+// ToCaptured converts a HAR entry into a Captured persona. Host,
+// Content-Length and pseudo-headers are dropped; the body is base64'd.
 func (e *Entry) ToCaptured(id, name string) *Captured {
 	c := &Captured{
-		Schema:  SchemaTag,
-		ID:      id,
-		Name:    name,
-		URL:     e.Request.URL,
-		Method:  e.Request.Method,
-		Headers: map[string]string{},
+		Schema: SchemaTag,
+		ID:     id,
+		Name:   name,
+		URL:    e.Request.URL,
+		Method: e.Request.Method,
 	}
 
 	for _, h := range e.Request.Headers {
@@ -150,16 +145,13 @@ func (e *Entry) ToCaptured(id, name string) *Captured {
 		case lname == "cookie":
 			c.Cookie = h.Value
 		case lname == "host", lname == "content-length":
-			// transport sets these; ignore
 		case strings.HasPrefix(lname, ":"):
-			// HTTP/2 pseudo-header
 		default:
-			c.Headers[h.Name] = h.Value
+			c.Headers = append(c.Headers, persona.HeaderField{Name: h.Name, Value: h.Value})
 		}
 	}
 
-	// Some HAR exporters split cookies into the Cookies array instead of
-	// a single Cookie header — reconstruct it.
+	// some exporters only fill the cookies array
 	if c.Cookie == "" && len(e.Request.Cookies) > 0 {
 		var parts []string
 		for _, ck := range e.Request.Cookies {
@@ -168,8 +160,24 @@ func (e *Entry) ToCaptured(id, name string) *Captured {
 		c.Cookie = strings.Join(parts, "; ")
 	}
 
-	if e.Request.PostData != nil && e.Request.PostData.Text != "" {
-		c.BodyB64 = base64.StdEncoding.EncodeToString([]byte(e.Request.PostData.Text))
+	if pd := e.Request.PostData; pd != nil {
+		switch {
+		case pd.Text != "":
+			c.BodyB64 = base64.StdEncoding.EncodeToString([]byte(pd.Text))
+		case len(pd.Params) > 0 && strings.Contains(strings.ToLower(pd.MimeType), "x-www-form-urlencoded"):
+			// params instead of text: rebuild in HAR order, not url.Values.Encode
+			// (which sorts). Shape and Kasada look at body field order.
+			var b strings.Builder
+			for i, p := range pd.Params {
+				if i > 0 {
+					b.WriteByte('&')
+				}
+				b.WriteString(url.QueryEscape(p.Name))
+				b.WriteByte('=')
+				b.WriteString(url.QueryEscape(p.Value))
+			}
+			c.BodyB64 = base64.StdEncoding.EncodeToString([]byte(b.String()))
+		}
 	}
 
 	return c
@@ -181,12 +189,22 @@ func LoadCaptured(path string) (*Captured, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read captured persona: %w", err)
 	}
+	// check the tag first so old v1 files get a clear error, not a json type error
+	var tag struct {
+		Schema string `json:"schema"`
+	}
+	if err := json.Unmarshal(data, &tag); err != nil {
+		return nil, fmt.Errorf("parse captured persona JSON: %w", err)
+	}
+	if tag.Schema != SchemaTag {
+		if strings.HasPrefix(tag.Schema, "wafprobe-captured-persona/") {
+			return nil, fmt.Errorf("captured persona was written by an older wafprobe (schema %q, want %q) — re-run `wafprobe import-har` to regenerate it", tag.Schema, SchemaTag)
+		}
+		return nil, fmt.Errorf("not a wafprobe captured persona (schema %q, want %q)", tag.Schema, SchemaTag)
+	}
 	var c Captured
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse captured persona JSON: %w", err)
-	}
-	if c.Schema != SchemaTag {
-		return nil, fmt.Errorf("captured persona schema mismatch: got %q, want %q", c.Schema, SchemaTag)
 	}
 	return &c, nil
 }
@@ -200,7 +218,8 @@ func SaveCaptured(path string, c *Captured) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	// holds session cookies and auth headers, so owner-only
+	return os.WriteFile(path, data, 0o600)
 }
 
 // Body returns the decoded body bytes, or nil if there's no body.

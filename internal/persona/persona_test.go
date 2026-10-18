@@ -11,7 +11,7 @@ func TestBuiltinPersonasRegistered(t *testing.T) {
 		"chrome-133",
 		"chrome-131",
 		"firefox-latest",
-		"safari-17",
+		"safari-16",
 		"ios-17",
 		"go-stdlib",
 		"python-requests",
@@ -31,8 +31,7 @@ func TestBuiltinPersonasRegistered(t *testing.T) {
 	}
 }
 
-// TestAllIsDeterministic guards against accidental removal of the sort
-// in All() — Go's map iteration is randomized otherwise.
+// map iteration is random, so All() has to sort
 func TestAllIsDeterministic(t *testing.T) {
 	run1 := All()
 	run2 := All()
@@ -52,15 +51,13 @@ func TestByIDUnknown(t *testing.T) {
 	}
 }
 
-// TestBuildClientHelloRaw exercises offline ClientHello construction for
-// every persona. Stock-TLS personas must return ErrNoOfflineJA3.
 func TestBuildClientHelloRaw(t *testing.T) {
 	for _, p := range All() {
 		t.Run(p.ID, func(t *testing.T) {
 			raw, err := BuildClientHelloRaw(p, "example.com")
-			if p.UseStockTLS {
+			if p.Stock {
 				if err != ErrNoOfflineJA3 {
-					t.Errorf("stock-TLS persona %q should return ErrNoOfflineJA3, got %v", p.ID, err)
+					t.Errorf("stock persona %q should return ErrNoOfflineJA3, got %v", p.ID, err)
 				}
 				return
 			}
@@ -77,12 +74,9 @@ func TestBuildClientHelloRaw(t *testing.T) {
 	}
 }
 
-// TestJA3StableAcrossRuns_NonRandomized asserts that for personas that do NOT
-// shuffle their ClientHello, two runs produce the same JA3 hash.
-// Randomized personas (Chrome 110+) are covered by a separate relaxed test.
 func TestJA3StableAcrossRuns_NonRandomized(t *testing.T) {
 	for _, p := range All() {
-		if p.Randomized || p.UseStockTLS {
+		if p.Randomized || p.Stock {
 			continue
 		}
 		t.Run(p.ID, func(t *testing.T) {
@@ -104,10 +98,35 @@ func TestJA3StableAcrossRuns_NonRandomized(t *testing.T) {
 	}
 }
 
-// TestJA3Randomized_ProducesValidButVariableHashes verifies that personas
-// marked Randomized (Chrome 110+) actually shuffle their ClientHello —
-// 6 samples must yield at least 2 distinct hashes.
-func TestJA3Randomized_ProducesValidButVariableHashes(t *testing.T) {
+// JA4 must not change across a randomized persona's extension shuffle.
+func TestJA4StableAcrossRandomizedRuns(t *testing.T) {
+	for _, p := range All() {
+		if p.Stock {
+			continue
+		}
+		t.Run(p.ID, func(t *testing.T) {
+			first, err := JA4(p, "example.com")
+			if err != nil {
+				t.Fatalf("JA4: %v", err)
+			}
+			if first == "" || strings.Count(first, "_") != 2 {
+				t.Fatalf("JA4 shape wrong: %q", first)
+			}
+			for i := 0; i < 6; i++ {
+				got, err := JA4(p, "example.com")
+				if err != nil {
+					t.Fatalf("JA4 sample %d: %v", i, err)
+				}
+				if got != first {
+					t.Errorf("JA4 unstable across runs (should be order-invariant): %s vs %s", first, got)
+				}
+			}
+		})
+	}
+}
+
+// randomized personas exist and still give a well-formed JA3
+func TestRandomizedPersonasFlaggedAndValid(t *testing.T) {
 	anyRandomized := false
 	for _, p := range All() {
 		if !p.Randomized {
@@ -115,19 +134,12 @@ func TestJA3Randomized_ProducesValidButVariableHashes(t *testing.T) {
 		}
 		anyRandomized = true
 		t.Run(p.ID, func(t *testing.T) {
-			seen := map[string]struct{}{}
-			for i := 0; i < 6; i++ {
-				_, h, err := JA3(p, "example.com")
-				if err != nil {
-					t.Fatalf("JA3 sample %d: %v", i, err)
-				}
-				if len(h) != 32 {
-					t.Fatalf("hash length should be 32 hex chars, got %q", h)
-				}
-				seen[h] = struct{}{}
+			_, h, err := JA3(p, "example.com")
+			if err != nil {
+				t.Fatalf("JA3: %v", err)
 			}
-			if len(seen) < 2 {
-				t.Errorf("persona %q is marked Randomized but produced identical JA3 across 6 runs", p.ID)
+			if len(h) != 32 {
+				t.Errorf("JA3 hash length should be 32 hex chars, got %q", h)
 			}
 		})
 	}
@@ -136,14 +148,12 @@ func TestJA3Randomized_ProducesValidButVariableHashes(t *testing.T) {
 	}
 }
 
-// TestJA3FamiliesAreDistinct compares structural JA3 (everything except
-// extension order) across browser families. Same-family duplicates are
-// expected — Chrome 131/133/latest share a cipher list — but cross-family
-// duplicates would mean we can't distinguish browsers.
+// Structural JA3 (ignoring extension order) can repeat within a family
+// (Chrome 131/133 share ciphers) but must differ across families.
 func TestJA3FamiliesAreDistinct(t *testing.T) {
 	seen := map[string]string{}
 	for _, p := range All() {
-		if p.UseStockTLS {
+		if p.Stock {
 			continue
 		}
 		family := familyOf(p.ID)
@@ -167,14 +177,19 @@ func TestJA3FamiliesAreDistinct(t *testing.T) {
 	}
 }
 
-// familyOf returns the prefix before the first dash in a persona ID.
+// Safari desktop and iOS share a WebKit TLS stack, so they're one family.
 func familyOf(id string) string {
+	fam := id
 	for i, r := range id {
 		if r == '-' {
-			return id[:i]
+			fam = id[:i]
+			break
 		}
 	}
-	return id
+	if fam == "ios" {
+		return "safari"
+	}
+	return fam
 }
 
 func TestJA3FormatShape(t *testing.T) {

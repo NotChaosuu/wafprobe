@@ -2,12 +2,10 @@ package hunt
 
 import (
 	"github.com/NotChaosuu/wafprobe/internal/client"
-	utls "github.com/refraction-networking/utls"
+	tls "github.com/bogdanfinn/utls"
 )
 
-// Mutation is a single-axis modification of a client.Options. Each
-// mutation should change ONE thing so the analyzer can attribute outcome
-// changes to that axis alone.
+// Mutation is a single-axis change to client.Options.
 type Mutation struct {
 	Name  string
 	Axis  string
@@ -23,16 +21,16 @@ func AllMutations() []Mutation {
 			Name: "force TLS 1.2",
 			Axis: "tls-version",
 			Apply: func(o *client.Options) {
-				o.MinTLSVersion = utls.VersionTLS12
-				o.MaxTLSVersion = utls.VersionTLS12
+				o.MinTLSVersion = tls.VersionTLS12
+				o.MaxTLSVersion = tls.VersionTLS12
 			},
 		},
 		{
 			Name: "force TLS 1.3",
 			Axis: "tls-version",
 			Apply: func(o *client.Options) {
-				o.MinTLSVersion = utls.VersionTLS13
-				o.MaxTLSVersion = utls.VersionTLS13
+				o.MinTLSVersion = tls.VersionTLS13
+				o.MaxTLSVersion = tls.VersionTLS13
 			},
 		},
 
@@ -107,49 +105,37 @@ func AllMutations() []Mutation {
 			},
 		},
 
-		// Headers — add suspicious
+		// Headers: add suspicious
 		{
 			Name: "add X-Forwarded-For: 127.0.0.1",
 			Axis: "headers",
 			Apply: func(o *client.Options) {
-				if o.ExtraHeaders == nil {
-					o.ExtraHeaders = map[string]string{}
-				}
-				o.ExtraHeaders["X-Forwarded-For"] = "127.0.0.1"
+				addHdr(o, "X-Forwarded-For", "127.0.0.1")
 			},
 		},
 		{
 			Name: "add X-Real-IP: 127.0.0.1",
 			Axis: "headers",
 			Apply: func(o *client.Options) {
-				if o.ExtraHeaders == nil {
-					o.ExtraHeaders = map[string]string{}
-				}
-				o.ExtraHeaders["X-Real-IP"] = "127.0.0.1"
+				addHdr(o, "X-Real-IP", "127.0.0.1")
 			},
 		},
 		{
 			Name: "add Referer: google.com",
 			Axis: "headers",
 			Apply: func(o *client.Options) {
-				if o.ExtraHeaders == nil {
-					o.ExtraHeaders = map[string]string{}
-				}
-				o.ExtraHeaders["Referer"] = "https://www.google.com/"
+				addHdr(o, "Referer", "https://www.google.com/")
 			},
 		},
 		{
 			Name: "add Accept-Language: en-US",
 			Axis: "headers",
 			Apply: func(o *client.Options) {
-				if o.ExtraHeaders == nil {
-					o.ExtraHeaders = map[string]string{}
-				}
-				o.ExtraHeaders["Accept-Language"] = "en-US,en;q=0.9"
+				addHdr(o, "Accept-Language", "en-US,en;q=0.9")
 			},
 		},
 
-		// Headers — drop common
+		// Headers: drop common
 		{
 			Name: "drop Accept-Encoding",
 			Axis: "headers",
@@ -186,8 +172,8 @@ func AllMutations() []Mutation {
 			Name: "TLS 1.2 + ALPN http/1.1",
 			Axis: "combo",
 			Apply: func(o *client.Options) {
-				o.MinTLSVersion = utls.VersionTLS12
-				o.MaxTLSVersion = utls.VersionTLS12
+				o.MinTLSVersion = tls.VersionTLS12
+				o.MaxTLSVersion = tls.VersionTLS12
 				o.ALPNOverride = []string{"http/1.1"}
 			},
 		},

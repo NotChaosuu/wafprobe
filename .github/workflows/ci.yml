@@ -31,10 +31,23 @@ jobs:
       - name: build
         run: go build ./...
 
+      # The race detector needs cgo, which is reliably present on the Linux and
+      # macOS runners but flaky on the Windows runner; run the plain suite there.
       - name: test
+        run: go test -count=1 ./...
+
+  race:
+    name: race (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+      - name: test -race
         run: go test -race -count=1 ./...
 
-  # staticcheck is lightweight and catches real bugs — no golangci-lint zoo.
   staticcheck:
     name: staticcheck
     runs-on: ubuntu-latest

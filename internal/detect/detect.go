@@ -3,23 +3,38 @@
 package detect
 
 import (
+	"bytes"
 	"net/http"
 	"sort"
 	"strings"
 )
 
-// Response is the subset of an *http.Response that detectors consume.
-// Decoupling lets tests build fixtures without standing up an HTTP server.
+// Response is the subset of an *http.Response that detectors read.
 type Response struct {
 	StatusCode int
 	Header     http.Header
 	Cookies    []*http.Cookie
-	// Body is a capped snapshot — detectors must not assume it's complete.
+	// Body is capped, may be truncated.
 	Body       []byte
 	ServerCert string
+
+	// lowercased Body, computed once; lots of detectors do case-insensitive checks.
+	lowerBody []byte
+	folded    bool
 }
 
-// FromHTTPResponse builds a Response from an *http.Response + body snapshot.
+func (r *Response) bodyHas(needle string) bool {
+	if r == nil || len(r.Body) == 0 {
+		return false
+	}
+	if !r.folded {
+		r.lowerBody = bytes.ToLower(r.Body)
+		r.folded = true
+	}
+	return bytes.Contains(r.lowerBody, []byte(strings.ToLower(needle)))
+}
+
+// FromHTTPResponse builds a Response from an *http.Response and body snapshot.
 func FromHTTPResponse(r *http.Response, body []byte) *Response {
 	if r == nil {
 		return nil
@@ -36,41 +51,35 @@ func FromHTTPResponse(r *http.Response, body []byte) *Response {
 	}
 }
 
-// Layer is where in the request lifecycle the WAF intercepted.
-// Values appear in JSON output; do not rename without a schema bump.
+// Layer is where the WAF intercepted. Values go into JSON output, don't rename.
 type Layer string
 
 const (
-	// LayerTLS — handshake-level block (rare; usually leaves no HTTP body).
-	LayerTLS Layer = "tls"
-	// LayerHTTP — 4xx/5xx block page.
-	LayerHTTP Layer = "http"
-	// LayerChallenge — JS/captcha interstitial.
+	// handshake-level block, usually no HTTP body
+	LayerTLS       Layer = "tls"
+	LayerHTTP      Layer = "http"
 	LayerChallenge Layer = "challenge"
-	// LayerSensor — vendor is profiling (e.g. _abck seed) but not blocking yet.
-	LayerSensor Layer = "sensor"
-	// LayerRateLimit — 429.
+	// vendor is profiling (e.g. _abck) but not blocking yet
+	LayerSensor    Layer = "sensor"
 	LayerRateLimit Layer = "rate-limit"
-	// LayerPass — request got through.
-	LayerPass Layer = "pass"
+	LayerPass      Layer = "pass"
 )
 
 // Detection is the result of running detectors on a Response.
 type Detection struct {
-	// Vendor identified, or "" if none matched.
 	Vendor string `json:"vendor,omitempty"`
-	// Layer where the request was intercepted.
-	Layer Layer `json:"layer"`
-	// Blocked is true for denied / challenged / rate-limited responses.
+	Layer  Layer  `json:"layer"`
+	// Blocked covers denied, challenged and rate-limited.
 	Blocked bool `json:"blocked"`
-	// Signals lists what matched (e.g. "header:cf-ray", "cookie:_abck").
+	// e.g. "header:cf-ray", "cookie:_abck"
 	Signals []string `json:"signals,omitempty"`
-	// Confidence: "high" = vendor-specific token, "low" = generic inference.
+	// "high" = vendor-specific token, "low" = generic inference
 	Confidence string `json:"confidence,omitempty"`
+	// Also holds other vendors that fired on the same response.
+	Also []Detection `json:"also,omitempty"`
 }
 
-// Detector identifies one vendor in a Response. Returns nil when no
-// evidence of that vendor is present, so Analyze can chain them cheaply.
+// Detector identifies one vendor; nil means no evidence.
 type Detector interface {
 	Vendor() string
 	Detect(resp *Response) *Detection
@@ -78,13 +87,12 @@ type Detector interface {
 
 var detectors []Detector
 
-// Register adds a detector to the default set used by Analyze.
-// Packages containing detectors call this from init().
+// Register adds a detector to the default set; call it from init().
 func Register(d Detector) {
 	detectors = append(detectors, d)
 }
 
-// Detectors returns the registered detectors sorted by vendor name (deterministic).
+// Detectors returns the registered detectors sorted by vendor name.
 func Detectors() []Detector {
 	out := make([]Detector, len(detectors))
 	copy(out, detectors)
@@ -92,11 +100,8 @@ func Detectors() []Detector {
 	return out
 }
 
-// Analyze runs every registered detector against resp and returns the
-// most informative match. Precedence: high-confidence Blocked > high
-// pass > first match > pass-through. If multiple high-confidence
-// detectors fire (e.g. CF in front of an Akamai origin), the BLOCKER wins
-// because that's what the caller needs to address.
+// Analyze runs every detector and returns the most useful match. A high
+// confidence blocker wins over a high confidence pass (CF in front of Akamai etc).
 func Analyze(resp *Response) Detection {
 	if resp == nil {
 		return Detection{Layer: LayerPass}
@@ -106,6 +111,7 @@ func Analyze(resp *Response) Detection {
 		highBlocked *Detection
 		highPass    *Detection
 		anyMatch    *Detection
+		all         []*Detection
 	)
 
 	for _, d := range Detectors() {
@@ -116,6 +122,7 @@ func Analyze(resp *Response) Detection {
 		if got.Vendor == "" {
 			got.Vendor = d.Vendor()
 		}
+		all = append(all, got)
 		if got.Confidence == "high" {
 			if got.Blocked && highBlocked == nil {
 				highBlocked = got
@@ -129,30 +136,76 @@ func Analyze(resp *Response) Detection {
 		}
 	}
 
+	var primary *Detection
 	switch {
 	case highBlocked != nil:
-		return *highBlocked
+		primary = highBlocked
 	case highPass != nil:
-		return *highPass
+		primary = highPass
 	case anyMatch != nil:
-		return *anyMatch
+		primary = anyMatch
+	}
+	if primary != nil {
+		primary.Also = othersThan(all, primary)
+		return *primary
 	}
 
-	return Detection{Layer: layerFromStatus(resp.StatusCode), Blocked: resp.StatusCode >= 400}
+	layer, blocked := statusLayer(resp)
+	return Detection{Layer: layer, Blocked: blocked}
+}
+
+func othersThan(all []*Detection, primary *Detection) []Detection {
+	var out []Detection
+	seen := map[string]bool{primary.Vendor: true}
+	for _, d := range all {
+		if seen[d.Vendor] {
+			continue
+		}
+		seen[d.Vendor] = true
+		out = append(out, Detection{
+			Vendor: d.Vendor, Layer: d.Layer, Blocked: d.Blocked, Confidence: d.Confidence,
+		})
+	}
+	return out
+}
+
+// benignStatus: 401/404/405-style statuses that are plain HTTP, not a WAF block.
+func benignStatus(status int, h http.Header) bool {
+	switch status {
+	case 404, 405, 410, 501:
+		return true
+	case 401:
+		return true // unauthenticated API call, not a bot block
+	case 403:
+		// 403 + WWW-Authenticate is auth
+		return h != nil && h.Get("WWW-Authenticate") != ""
+	}
+	return false
+}
+
+// statusLayer maps a status to layer + blocked, benign non-2xx counts as pass.
+func statusLayer(resp *Response) (Layer, bool) {
+	if resp != nil && benignStatus(resp.StatusCode, resp.Header) {
+		return LayerPass, false
+	}
+	code := 0
+	if resp != nil {
+		code = resp.StatusCode
+	}
+	switch {
+	case code == 429:
+		return LayerRateLimit, true
+	case code >= 400:
+		return LayerHTTP, true
+	default:
+		return LayerPass, false
+	}
 }
 
 func layerFromStatus(code int) Layer {
-	switch {
-	case code == 429:
-		return LayerRateLimit
-	case code >= 400:
-		return LayerHTTP
-	default:
-		return LayerPass
-	}
+	l, _ := statusLayer(&Response{StatusCode: code})
+	return l
 }
-
-// Helpers shared across vendor detectors.
 
 func hasHeader(h http.Header, name string) (string, bool) {
 	if h == nil {
