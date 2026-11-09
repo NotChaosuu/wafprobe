@@ -169,7 +169,21 @@ func othersThan(all []*Detection, primary *Detection) []Detection {
 	return out
 }
 
+// verdictHeader reads the headers in which a vendor states its own decision.
+// When one is present it decides the layer, whatever the status says: AWS
+// serves a CAPTCHA as 405 and a Challenge as 202, and neither is a plain
+// "method not allowed" or a pass.
+func verdictHeader(h http.Header) (Layer, bool) {
+	for _, f := range []func(http.Header) (Layer, bool){awsWAFAction, cfMitigated, vercelMitigated} {
+		if layer, ok := f(h); ok {
+			return layer, true
+		}
+	}
+	return "", false
+}
+
 // benignStatus: 401/404/405-style statuses that are plain HTTP, not a WAF block.
+// statusLayer checks verdictHeader first, so these never hide a vendor verdict.
 func benignStatus(status int, h http.Header) bool {
 	switch status {
 	case 404, 405, 410, 501:
@@ -185,6 +199,11 @@ func benignStatus(status int, h http.Header) bool {
 
 // statusLayer maps a status to layer + blocked, benign non-2xx counts as pass.
 func statusLayer(resp *Response) (Layer, bool) {
+	if resp != nil {
+		if layer, ok := verdictHeader(resp.Header); ok {
+			return layer, true
+		}
+	}
 	if resp != nil && benignStatus(resp.StatusCode, resp.Header) {
 		return LayerPass, false
 	}

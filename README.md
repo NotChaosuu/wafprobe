@@ -110,7 +110,7 @@ wafprobe does **not** validate the target's TLS certificate — it's inspecting 
 - DataDome
 - PerimeterX / HUMAN
 - Imperva / Incapsula
-- AWS WAF
+- AWS WAF — blocks (403 by default), plus the Challenge and CAPTCHA actions, which AWS answers with a 202 and a 405 and names in `x-amzn-waf-action`; both are reported as `challenge`. The `aws-waf-token` cookie counts as an AWS marker.
 - Kasada — `X-KPSDK-*` headers, the sensor script (wherever it loads from, not just `/ips.js`), 429 default block.
 - Shape / F5 XC Bot Defense — pattern-matches the `X-<8char-id>-<letter>` request-header family (`X-[A-Za-z0-9]{6,12}-[A-Z][0-9]?`, two matching ids required). A lone `TS<hex>` cookie is reported as plain `f5-bigip`, not Shape, since it only proves a BIG-IP is in the path.
 
@@ -122,7 +122,7 @@ The other nineteen are fingerprinted from headers, cookies, and block-page marke
 
 Some vendors are deliberately absent: Netacea is agentless and leaves no passive fingerprint, and StackPath's CDN shut down in 2023 — wafprobe doesn't pretend to detect them.
 
-Every detection is tagged with a layer — `pass`, `sensor` (profiling but not blocking yet), `http` (block page), `challenge` (JS interstitial), or `rate-limit` — and a confidence (`high` for a vendor-unique token, `low` for a shared CDN marker), so a `Via: cloudfront` never masquerades as a WAF verdict. When two vendors fire on one response (a CDN in front of a captcha), the primary is shown and the rest are kept in an `also` list rather than dropped. Ordinary non-2xx codes (a 404, a 405, an unauthenticated 401) are not read as blocks unless a vendor actually fires.
+Every detection is tagged with a layer — `pass`, `sensor` (profiling but not blocking yet), `http` (block page), `challenge` (JS interstitial), or `rate-limit` — and a confidence (`high` for a vendor-unique token, `low` for a shared CDN marker), so a `Via: cloudfront` never masquerades as a WAF verdict. When two vendors fire on one response (a CDN in front of a captcha), the primary is shown and the rest are kept in an `also` list rather than dropped. Ordinary non-2xx codes (a 404, a 405, an unauthenticated 401) are not read as blocks unless a vendor actually fires. A vendor's own verdict header (`x-amzn-waf-action`, Cloudflare's `cf-mitigated`, Vercel's `x-vercel-mitigated`) decides the layer whatever the status code says.
 
 ## Honest limits
 

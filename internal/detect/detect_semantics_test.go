@@ -85,3 +85,60 @@ func TestMultiVendorAlso(t *testing.T) {
 		t.Fatalf("a stacked deployment must record other vendors in Also, got %+v", got)
 	}
 }
+
+// A vendor's own verdict header decides the layer on any status. AWS serves a
+// Challenge as 202 and a CAPTCHA as 405; without the header both would read as
+// a pass (405 is in benignStatus).
+func TestVerdictHeaderBeatsStatus(t *testing.T) {
+	cases := []struct {
+		name      string
+		resp      *Response
+		wantVend  string
+		wantLayer Layer
+	}{
+		{"aws-challenge-202", mkResp(202, map[string]string{"X-Amzn-Waf-Action": "challenge"}, nil, ""), "aws-waf", LayerChallenge},
+		{"aws-captcha-405", mkResp(405, map[string]string{"X-Amzn-Waf-Action": "captcha"}, nil, ""), "aws-waf", LayerChallenge},
+		{"aws-captcha-405-behind-cloudfront", mkResp(405, map[string]string{"X-Amzn-Waf-Action": "captcha", "X-Amz-Cf-Id": "abc"}, nil, ""), "aws-waf", LayerChallenge},
+		{"aws-block-403", mkResp(403, map[string]string{"X-Amzn-ErrorType": "WAFBlockException"}, nil, ""), "aws-waf", LayerHTTP},
+		{"cf-challenge-200", mkResp(200, map[string]string{"CF-Ray": "abc", "CF-Mitigated": "challenge"}, nil, ""), "cloudflare", LayerChallenge},
+		{"cf-challenge-405", mkResp(405, map[string]string{"CF-Ray": "abc", "CF-Mitigated": "challenge"}, nil, ""), "cloudflare", LayerChallenge},
+		{"cf-challenge-429", mkResp(429, map[string]string{"CF-Ray": "abc", "CF-Mitigated": "challenge"}, nil, ""), "cloudflare", LayerChallenge},
+		{"vercel-deny-403", mkResp(403, map[string]string{"X-Vercel-Mitigated": "deny"}, nil, ""), "vercel", LayerHTTP},
+		{"vercel-challenge-403", mkResp(403, map[string]string{"X-Vercel-Mitigated": "challenge"}, nil, ""), "vercel", LayerChallenge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Analyze(tc.resp)
+			if got.Vendor != tc.wantVend || got.Layer != tc.wantLayer || !got.Blocked {
+				t.Errorf("got vendor=%q layer=%q blocked=%v, want %q/%q/true (signals %v)",
+					got.Vendor, got.Layer, got.Blocked, tc.wantVend, tc.wantLayer, got.Signals)
+			}
+		})
+	}
+}
+
+// 405 with no vendor marker is still an ordinary "method not allowed".
+func TestBare405StaysBenign(t *testing.T) {
+	for _, r := range []*Response{
+		mkResp(405, nil, nil, "method not allowed"),
+		mkResp(405, map[string]string{"Allow": "GET, HEAD", "Server": "nginx"}, nil, ""),
+		mkResp(405, map[string]string{"X-Amz-Cf-Id": "abc"}, nil, ""), // CloudFront label only
+	} {
+		if got := Analyze(r); got.Blocked || got.Layer != LayerPass {
+			t.Errorf("405 without a vendor verdict must stay a pass, got %+v", got)
+		}
+	}
+}
+
+// statusLayer is what the low-confidence labels (CloudFront, akamai-cdn) and the
+// no-vendor fallback use, so it must honour verdict headers before benignStatus.
+func TestStatusLayerHonoursVerdictHeader(t *testing.T) {
+	layer, blocked := statusLayer(mkResp(405, map[string]string{"X-Amzn-Waf-Action": "captcha"}, nil, ""))
+	if layer != LayerChallenge || !blocked {
+		t.Errorf("statusLayer(405 + captcha) = %q/%v, want challenge/true", layer, blocked)
+	}
+	cf := cdnLabel(mkResp(405, map[string]string{"X-Amzn-Waf-Action": "captcha", "X-Amz-Cf-Id": "abc"}, nil, ""), "cloudfront", nil)
+	if cf.Layer != LayerChallenge || !cf.Blocked {
+		t.Errorf("CloudFront label on an AWS CAPTCHA = %q/%v, want challenge/true", cf.Layer, cf.Blocked)
+	}
+}

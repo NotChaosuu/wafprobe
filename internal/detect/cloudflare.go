@@ -1,6 +1,9 @@
 package detect
 
-import "strings"
+import (
+	"net/http"
+	"strings"
+)
 
 // Cloudflare detector. Managed Challenge ("Just a moment...", 403/503) is a
 // block; a Turnstile widget on a 200 only gates the page's forms.
@@ -58,13 +61,19 @@ func (cloudflare) Detect(resp *Response) *Detection {
 		Signals:    signals,
 	}
 
-	mitigated, _ := hasHeader(resp.Header, "CF-Mitigated")
+	// cf-mitigated is Cloudflare saying it challenged the request, so it
+	// outranks the status code, 429 included.
+	if layer, ok := cfMitigated(resp.Header); ok {
+		det.Layer = layer
+		det.Blocked = true
+		return det
+	}
 
 	switch {
 	case resp.StatusCode == 429:
 		det.Layer = LayerRateLimit
 		det.Blocked = true
-	case mitigated == "challenge" || resp.StatusCode == 503 || isManagedChallenge:
+	case resp.StatusCode == 503 || isManagedChallenge:
 		det.Layer = LayerChallenge
 		det.Blocked = true
 	case resp.StatusCode == 403:
@@ -84,6 +93,13 @@ func (cloudflare) Detect(resp *Response) *Detection {
 }
 
 func init() { Register(cloudflare{}) }
+
+func cfMitigated(h http.Header) (Layer, bool) {
+	if v, ok := hasHeader(h, "CF-Mitigated"); ok && strings.EqualFold(strings.TrimSpace(v), "challenge") {
+		return LayerChallenge, true
+	}
+	return "", false
+}
 
 func short(s string, n int) string {
 	if len(s) <= n {

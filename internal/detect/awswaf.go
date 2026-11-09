@@ -1,7 +1,17 @@
 package detect
 
+import (
+	"net/http"
+	"strings"
+)
+
 // AWS WAF block pages come from the customer's rules, so there's no universal
-// interstitial. Confidence stays medium unless an x-amzn-waf-* header shows up.
+// interstitial. Confidence stays medium unless an x-amzn-waf-* header or the
+// aws-waf-token cookie shows up.
+//
+// Block defaults to 403, but CAPTCHA and Challenge don't: AWS answers a
+// Challenge with 202 and a CAPTCHA with 405, and says which one in
+// x-amzn-waf-action. Going by status alone, both read as a pass.
 
 type awsWAF struct{}
 
@@ -22,9 +32,18 @@ func (awsWAF) Detect(resp *Response) *Detection {
 	}
 	for name := range resp.Header {
 		if hasPrefixFold(name, "X-Amzn-Waf-") {
-			signals = append(signals, "header:"+name)
+			sig := "header:" + name
+			if strings.EqualFold(name, "X-Amzn-Waf-Action") {
+				sig = "header:x-amzn-waf-action=" + short(resp.Header.Get(name), 16)
+			}
+			signals = append(signals, sig)
 			confidence = "high"
 		}
+	}
+	// set once a client has passed a Challenge or CAPTCHA
+	if _, ok := hasCookie(resp.Cookies, "aws-waf-token"); ok {
+		signals = append(signals, "cookie:aws-waf-token")
+		confidence = "high"
 	}
 	if resp.bodyHas("aws waf") && resp.bodyHas("request blocked") {
 		signals = append(signals, "body:aws-waf-block")
@@ -48,6 +67,12 @@ func (awsWAF) Detect(resp *Response) *Detection {
 		Signals:    signals,
 	}
 
+	if layer, ok := awsWAFAction(resp.Header); ok {
+		det.Layer = layer
+		det.Blocked = true
+		return det
+	}
+
 	switch {
 	case resp.StatusCode == 429:
 		det.Layer = LayerRateLimit
@@ -64,6 +89,21 @@ func (awsWAF) Detect(resp *Response) *Detection {
 	}
 
 	return det
+}
+
+// awsWAFAction reads x-amzn-waf-action. Both values put an interstitial in
+// front of the page, and wafprobe has no separate CAPTCHA layer, so both map
+// to the challenge layer.
+func awsWAFAction(h http.Header) (Layer, bool) {
+	v, ok := hasHeader(h, "X-Amzn-Waf-Action")
+	if !ok {
+		return "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "challenge", "captcha":
+		return LayerChallenge, true
+	}
+	return "", false
 }
 
 func init() { Register(awsWAF{}) }

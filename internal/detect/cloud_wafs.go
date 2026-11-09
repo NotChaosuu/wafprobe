@@ -1,5 +1,10 @@
 package detect
 
+import (
+	"net/http"
+	"strings"
+)
+
 type azureFrontDoor struct{}
 
 func (azureFrontDoor) Vendor() string { return "azure-front-door" }
@@ -50,9 +55,6 @@ func (vercel) Detect(resp *Response) *Detection {
 	challenge := false
 	if v, ok := hasHeader(resp.Header, "X-Vercel-Mitigated"); ok {
 		signals = append(signals, "header:x-vercel-mitigated="+v)
-		if v == "challenge" {
-			challenge = true
-		}
 	}
 	if _, ok := hasHeader(resp.Header, "X-Vercel-Challenge-Token"); ok {
 		signals = append(signals, "header:x-vercel-challenge-token")
@@ -66,13 +68,32 @@ func (vercel) Detect(resp *Response) *Detection {
 		return nil
 	}
 	det := &Detection{Vendor: "vercel", Confidence: "high", Signals: signals}
-	if challenge {
+	if layer, ok := vercelMitigated(resp.Header); ok {
+		det.Layer = layer
+		det.Blocked = true
+	} else if challenge {
 		det.Layer = LayerChallenge
 		det.Blocked = true
 	} else {
 		det.Layer = LayerPass
 	}
 	return det
+}
+
+// vercelMitigated reads x-vercel-mitigated: "challenge" is the Security
+// Checkpoint, "deny" is a firewall or DDoS-mitigation block (normally a 403).
+func vercelMitigated(h http.Header) (Layer, bool) {
+	v, ok := hasHeader(h, "X-Vercel-Mitigated")
+	if !ok {
+		return "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "challenge":
+		return LayerChallenge, true
+	case "deny":
+		return LayerHTTP, true
+	}
+	return "", false
 }
 
 type reblaze struct{}

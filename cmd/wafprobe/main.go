@@ -23,7 +23,7 @@ import (
 )
 
 // Version is overridable at build time: -ldflags "-X main.Version=x.y.z".
-var Version = "1.0.0"
+var Version = "1.0.1"
 
 const topUsage = `wafprobe — probe a target's WAF stack. 27 vendors.
 

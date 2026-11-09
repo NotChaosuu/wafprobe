@@ -524,6 +524,36 @@ func TestAWSWAF(t *testing.T) {
 			true, LayerHTTP, true, "high",
 		},
 		{
+			"challenge: 202 + x-amzn-waf-action challenge",
+			mkResp(202, map[string]string{"X-Amzn-Waf-Action": "challenge"}, nil, "<html>challenge.js</html>"),
+			true, LayerChallenge, true, "high",
+		},
+		{
+			"captcha: 405 + x-amzn-waf-action captcha",
+			mkResp(405, map[string]string{"X-Amzn-Waf-Action": "captcha"}, nil, "<html>captcha.js</html>"),
+			true, LayerChallenge, true, "high",
+		},
+		{
+			"captcha: header value is case-insensitive",
+			mkResp(405, map[string]string{"X-Amzn-Waf-Action": "CAPTCHA"}, nil, ""),
+			true, LayerChallenge, true, "high",
+		},
+		{
+			"captcha header wins over a 403",
+			mkResp(403, map[string]string{"X-Amzn-Waf-Action": "captcha"}, nil, ""),
+			true, LayerChallenge, true, "high",
+		},
+		{
+			"block: plain 403 with WAFBlockException stays http",
+			mkResp(403, map[string]string{"X-Amzn-ErrorType": "WAFBlockException", "X-Amz-Cf-Id": "abc"}, nil, ""),
+			true, LayerHTTP, true, "high",
+		},
+		{
+			"pass: aws-waf-token cookie on a 200",
+			mkResp(200, nil, []*http.Cookie{ck("aws-waf-token", "tok")}, "<html>ok</html>"),
+			true, LayerPass, false, "high",
+		},
+		{
 			"low: cloudfront 403 without AWS WAF specific header",
 			mkResp(403, map[string]string{"X-Amz-Cf-Id": "abc"}, nil, ""),
 			true, LayerHTTP, true, "low",
